@@ -32,6 +32,17 @@ type LedgerEntry struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type StressEvent struct {
+	ID           pgtype.UUID        `json:"id"`
+	RunID        string             `json:"run_id"`
+	EventType    string             `json:"event_type"`
+	AccountID    pgtype.UUID        `json:"account_id"`
+	Success      bool               `json:"success"`
+	LatencyMs    float64            `json:"latency_ms"`
+	ErrorMessage pgtype.Text        `json:"error_message"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type Transaction struct {
 	ID                   pgtype.UUID        `json:"id"`
 	TransactionType      string             `json:"transaction_type"`

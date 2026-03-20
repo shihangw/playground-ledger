@@ -6,11 +6,13 @@ import (
 	"github.com/shihangw/playground-ledger/internal/api/handlers"
 	"github.com/shihangw/playground-ledger/internal/api/middleware"
 	"github.com/shihangw/playground-ledger/internal/wallet"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // RouterConfig contains configuration for the router
 type RouterConfig struct {
 	WalletService *wallet.Service
+	Pool          *pgxpool.Pool
 }
 
 // NewRouter creates and configures the HTTP router
@@ -18,12 +20,22 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	mux := http.NewServeMux()
 
 	walletHandler := handlers.NewWalletHandler(cfg.WalletService)
+	adminHandler := handlers.NewAdminHandler(cfg.WalletService)
+	stressHandler := handlers.NewStressHandler(cfg.Pool)
 
 	// Health check (no auth)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status": "ok"}`))
 	})
+
+	// Admin routes (no auth for stress testing)
+	mux.HandleFunc("POST /v1/admin/seed", adminHandler.Seed)
+
+	// Stress test event logging and metrics (no auth)
+	mux.HandleFunc("POST /v1/admin/stress/events", stressHandler.LogEvents)
+	mux.HandleFunc("GET /v1/admin/stress/runs", stressHandler.ListRuns)
+	mux.HandleFunc("GET /v1/admin/stress/runs/{run_id}", stressHandler.GetRunSummary)
 
 	// Protected routes
 	protected := http.NewServeMux()
@@ -50,6 +62,7 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	// Mount routes
 	finalMux := http.NewServeMux()
 	finalMux.Handle("/health", middleware.CORSMiddleware(mux))
+	finalMux.Handle("/v1/admin/", middleware.CORSMiddleware(mux))
 	finalMux.Handle("/", handler)
 
 	return finalMux

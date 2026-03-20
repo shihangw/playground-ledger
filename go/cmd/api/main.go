@@ -45,6 +45,7 @@ func main() {
 	// Create router
 	router := api.NewRouter(api.RouterConfig{
 		WalletService: walletService,
+		Pool:          pool,
 	})
 
 	// Create server

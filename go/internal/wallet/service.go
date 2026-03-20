@@ -206,6 +206,11 @@ func (s *Service) GetAllAccounts(ctx context.Context, limit, offset int32) ([]ge
 	})
 }
 
+// SeedIdempotencyKey generates a deterministic idempotency key for seeding
+func SeedIdempotencyKey(externalID string, balance decimal.Decimal) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceDNS, []byte("seed_"+externalID+"_"+balance.String()))
+}
+
 // Helper function to convert uuid.UUID to pgtype.UUID
 func toPgUUID(u uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: u, Valid: true}
