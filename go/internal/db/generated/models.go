@@ -19,6 +19,30 @@ type Account struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CreditGrant struct {
+	ID              pgtype.UUID        `json:"id"`
+	AccountID       pgtype.UUID        `json:"account_id"`
+	GrantType       string             `json:"grant_type"`
+	InitialAmount   decimal.Decimal    `json:"initial_amount"`
+	RemainingAmount decimal.Decimal    `json:"remaining_amount"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	Status          string             `json:"status"`
+	IdempotencyKey  pgtype.UUID        `json:"idempotency_key"`
+	Metadata        []byte             `json:"metadata"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type GrantLedgerEntry struct {
+	ID             pgtype.UUID        `json:"id"`
+	GrantID        pgtype.UUID        `json:"grant_id"`
+	EntryType      string             `json:"entry_type"`
+	Amount         decimal.Decimal    `json:"amount"`
+	RemainingAfter decimal.Decimal    `json:"remaining_after"`
+	Description    pgtype.Text        `json:"description"`
+	IdempotencyKey pgtype.UUID        `json:"idempotency_key"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type LedgerEntry struct {
 	ID             pgtype.UUID        `json:"id"`
 	AccountID      pgtype.UUID        `json:"account_id"`

@@ -15,7 +15,7 @@ export interface StressResult {
   success: boolean;
   latencyMs: number;
   error?: string;
-  errorType?: "insufficient_funds" | "contention" | "timeout" | "other";
+  errorType?: "insufficient_funds" | "insufficient_grants" | "contention" | "timeout" | "other";
 }
 
 export interface StressStats {

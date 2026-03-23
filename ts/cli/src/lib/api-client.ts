@@ -1,5 +1,7 @@
 import { SeedResponse, StressResult, AccountInfo } from "./types.js";
 
+const REQUEST_TIMEOUT = 10_000; // 10s timeout for all requests
+
 export class LedgerClient {
   constructor(private baseUrl: string) {}
 
@@ -16,6 +18,7 @@ export class LedgerClient {
         prefix,
         initial_balance: initialBalance,
       }),
+      signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -33,6 +36,7 @@ export class LedgerClient {
       `${this.baseUrl}/v1/users?limit=${limit}&offset=${offset}`,
       {
         headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT),
       }
     );
     if (!res.ok) {
@@ -121,6 +125,100 @@ export class LedgerClient {
     }
   }
 
+  async issueGrant(
+    accountId: string,
+    amount: string,
+    grantType: string,
+    expiresAt: string,
+    token: string
+  ): Promise<StressResult> {
+    const start = performance.now();
+    try {
+      const res = await fetch(
+        `${this.baseUrl}/v1/accounts/${accountId}/grants`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            "Idempotency-Key": crypto.randomUUID(),
+          },
+          body: JSON.stringify({
+            amount,
+            grant_type: grantType,
+            expires_at: expiresAt,
+          }),
+        }
+      );
+      const latencyMs = performance.now() - start;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return {
+          success: false,
+          latencyMs,
+          error: (body as Record<string, string>).error || `HTTP ${res.status}`,
+          errorType: classifyError(res.status, (body as Record<string, string>).error),
+        };
+      }
+      return { success: true, latencyMs };
+    } catch (err) {
+      return {
+        success: false,
+        latencyMs: performance.now() - start,
+        error: String(err),
+        errorType: "timeout",
+      };
+    }
+  }
+
+  async drawdownGrant(
+    accountId: string,
+    amount: string,
+    token: string
+  ): Promise<StressResult> {
+    const start = performance.now();
+    try {
+      const res = await fetch(
+        `${this.baseUrl}/v1/accounts/${accountId}/grants/drawdown`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            "Idempotency-Key": crypto.randomUUID(),
+          },
+          body: JSON.stringify({ amount }),
+        }
+      );
+      const latencyMs = performance.now() - start;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        return {
+          success: false,
+          latencyMs,
+          error: (body as Record<string, string>).error || `HTTP ${res.status}`,
+          errorType: classifyError(res.status, (body as Record<string, string>).error),
+        };
+      }
+      return { success: true, latencyMs };
+    } catch (err) {
+      return {
+        success: false,
+        latencyMs: performance.now() - start,
+        error: String(err),
+        errorType: "timeout",
+      };
+    }
+  }
+
+  async expireGrants(): Promise<{ expired_count: number }> {
+    const res = await fetch(`${this.baseUrl}/v1/admin/grants/expire`, {
+      method: "POST",
+    });
+    if (!res.ok) throw new Error(`Expire grants failed (${res.status})`);
+    return res.json() as Promise<{ expired_count: number }>;
+  }
+
   async logEvents(
     events: Array<{
       run_id: string;
@@ -159,6 +257,7 @@ function classifyError(
   status: number,
   message?: string
 ): StressResult["errorType"] {
+  if (message?.includes("insufficient grant")) return "insufficient_grants";
   if (message?.includes("insufficient funds")) return "insufficient_funds";
   if (status === 500) return "contention";
   if (status === 408 || status === 504) return "timeout";

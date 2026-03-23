@@ -47,15 +47,15 @@ export class Reporter {
     const p95 = this.percentile(95);
     const p99 = this.percentile(99);
 
-    process.stderr.write(
-      `\r[${elapsed.toFixed(0)}s] ` +
+    console.log(
+      `[${elapsed.toFixed(0)}s] ` +
         `req: ${this.stats.totalRequests} | ` +
         `rps: ${currentRps.toFixed(0)} | ` +
         `ok: ${this.stats.successCount} | ` +
         `err: ${this.stats.errorCount} | ` +
         `p50: ${p50.toFixed(0)}ms | ` +
         `p95: ${p95.toFixed(0)}ms | ` +
-        `p99: ${p99.toFixed(0)}ms   `
+        `p99: ${p99.toFixed(0)}ms`
     );
   }
 

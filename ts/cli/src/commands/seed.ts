@@ -11,17 +11,30 @@ export async function seedCommand(opts: {
   console.log(
     `Seeding ${opts.count} users with prefix "${opts.prefix}" and $${opts.initialBalance} balance...`
   );
-  console.log(`API: ${opts.apiUrl}`);
+  console.log(`API: ${opts.apiUrl}\n`);
 
   const start = performance.now();
-  const result = await client.seed(
-    opts.count,
-    opts.prefix,
-    opts.initialBalance
-  );
+  let result;
+  try {
+    result = await client.seed(opts.count, opts.prefix, opts.initialBalance);
+  } catch (err) {
+    const msg = String(err);
+    if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+      console.error(`Error: Cannot connect to API at ${opts.apiUrl}`);
+      console.error("Is the server running? Start it with: cd go && go run cmd/api/main.go");
+      process.exit(1);
+    }
+    if ((err as Error).name === "TimeoutError") {
+      console.error(`Error: Seed request timed out creating ${opts.count} users.`);
+      console.error("Try fewer users: --count 20");
+      process.exit(1);
+    }
+    console.error(`Error: ${msg}`);
+    process.exit(1);
+  }
   const elapsed = ((performance.now() - start) / 1000).toFixed(1);
 
-  console.log(`\nCreated ${result.created} users in ${elapsed}s`);
+  console.log(`Created ${result.created} users in ${elapsed}s`);
 
   if (result.errors && result.errors.length > 0) {
     console.log(`\nErrors (${result.errors.length}):`);
@@ -33,7 +46,6 @@ export async function seedCommand(opts: {
     }
   }
 
-  // Print first few users as sample
   console.log(`\nSample users:`);
   for (const user of result.users.slice(0, 5)) {
     console.log(

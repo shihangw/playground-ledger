@@ -1,14 +1,27 @@
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import os from "node:os";
 import { LedgerClient } from "../lib/api-client.js";
 import { Reporter } from "../lib/reporter.js";
 import { AccountInfo } from "../lib/types.js";
 
+export type StressMode =
+  | "deposits"
+  | "withdrawals"
+  | "mixed"
+  | "credit-grants"
+  | "credit-drawdown"
+  | "credit-mixed";
+
 interface StressOpts {
   apiUrl: string;
-  mode: "grants" | "consumption" | "mixed";
+  mode: StressMode;
   concurrency: number;
-  duration: number; // seconds
-  rate: number; // target requests per second
+  duration: number;
+  rate: number;
   prefix: string;
+  workers: number;
 }
 
 interface PendingEvent {
@@ -25,113 +38,141 @@ export async function stressCommand(opts: StressOpts) {
   const reporter = new Reporter();
   const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-  console.log(`Stress test: mode=${opts.mode} concurrency=${opts.concurrency} rate=${opts.rate}/s duration=${opts.duration}s`);
+  const numWorkers = Math.min(opts.workers, opts.rate); // no point in more workers than RPS
+
+  console.log(
+    `Stress test: mode=${opts.mode} rate=${opts.rate}/s concurrency=${opts.concurrency} ` +
+    `duration=${opts.duration}s workers=${numWorkers}`
+  );
   console.log(`Run ID: ${runId}`);
   console.log(`API: ${opts.apiUrl}`);
 
   // Fetch users
   console.log("Fetching user accounts...");
   const token = `dev_${opts.prefix}_user_0`;
-  const accounts = await client.getUsers(token, 100, 0);
+  let accounts: AccountInfo[];
+  try {
+    accounts = await client.getUsers(token, 100, 0);
+  } catch (err) {
+    const msg = String(err);
+    if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+      console.error(`\nError: Cannot connect to API at ${opts.apiUrl}`);
+      console.error("Is the server running? Start it with: cd go && go run cmd/api/main.go");
+      process.exit(1);
+    }
+    console.error(`\nError fetching users: ${msg}`);
+    process.exit(1);
+  }
 
   if (accounts.length === 0) {
     console.error("No users found. Run 'seed' first.");
     process.exit(1);
   }
-  console.log(`Found ${accounts.length} accounts\n`);
+  console.log(`Found ${accounts.length} accounts`);
 
-  const deadline = Date.now() + opts.duration * 1000;
-  const delayMs = 1000 / opts.rate;
-  let inflight = 0;
+  // Seed grants for drawdown modes
+  if (opts.mode === "credit-drawdown" || opts.mode === "credit-mixed") {
+    console.log("Seeding initial grants for drawdown testing...");
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    let seeded = 0;
+    for (const account of accounts) {
+      const userToken = `dev_${account.user_id}`;
+      const result = await client.issueGrant(
+        account.id, "1000000.00", "PROMOTION", expiresAt, userToken
+      );
+      if (result.success) seeded++;
+    }
+    console.log(`Seeded grants for ${seeded}/${accounts.length} accounts`);
+  }
 
-  // Buffer events and flush in batches
+  // Event buffer for server-side logging
   let eventBuffer: PendingEvent[] = [];
-  const FLUSH_SIZE = 50;
-
+  const FLUSH_SIZE = 100;
   const flushEvents = async () => {
     if (eventBuffer.length === 0) return;
     const batch = eventBuffer;
     eventBuffer = [];
-    try {
-      await client.logEvents(batch);
-    } catch {
-      // Don't let event logging failures affect the stress test
-    }
+    try { await client.logEvents(batch); } catch { /* ignore */ }
   };
+
+  // Resolve worker script path
+  const thisFile = fileURLToPath(import.meta.url);
+  const workerScript = path.resolve(path.dirname(thisFile), "../lib/worker.ts");
+
+  // Split rate and concurrency across workers
+  const perWorkerRate = Math.ceil(opts.rate / numWorkers);
+  const perWorkerConcurrency = Math.ceil(opts.concurrency / numWorkers);
+
+  console.log(`\nStarting ${numWorkers} workers (${perWorkerRate} rps × ${perWorkerConcurrency} concurrency each)...\n`);
 
   reporter.start();
 
-  const runTask = async (
-    type: "grant" | "consume",
-    account: AccountInfo
-  ) => {
-    const userToken = `dev_${account.user_id}`;
-    const eventType = type === "grant" ? "DEPOSIT" : "WITHDRAWAL";
-    let result;
-    if (type === "grant") {
-      // Random grant: $10 - $500
-      const amount = (Math.random() * 490 + 10).toFixed(2);
-      result = await client.deposit(account.id, amount, userToken);
-    } else {
-      // Small consumption: $0.01 - $1.00
-      const amount = (Math.random() * 0.99 + 0.01).toFixed(2);
-      result = await client.withdraw(account.id, amount, userToken);
-    }
-    reporter.record(result.success, result.latencyMs, result.errorType);
+  let workersCompleted = 0;
 
-    // Buffer event for server-side logging
-    eventBuffer.push({
-      run_id: runId,
-      event_type: eventType,
-      account_id: account.id,
-      success: result.success,
-      latency_ms: result.latencyMs,
-      error_message: result.error,
-    });
-    if (eventBuffer.length >= FLUSH_SIZE) {
-      flushEvents();
-    }
-
-    inflight--;
-  };
-
-  const pickRandom = () => accounts[Math.floor(Math.random() * accounts.length)];
-
-  // Main loop - emit requests at target rate
   await new Promise<void>((resolve) => {
-    const tick = () => {
-      if (Date.now() >= deadline) {
-        resolve();
-        return;
-      }
+    for (let w = 0; w < numWorkers; w++) {
+      const workerConfig = {
+        apiUrl: opts.apiUrl,
+        mode: opts.mode,
+        accounts,
+        rate: perWorkerRate,
+        concurrency: perWorkerConcurrency,
+        duration: opts.duration,
+        runId,
+        workerId: w,
+      };
 
-      if (inflight < opts.concurrency) {
-        inflight++;
-        const account = pickRandom();
+      const child = fork(workerScript, [JSON.stringify(workerConfig)], {
+        execArgv: ["--import", "tsx"],
+        stdio: ["ignore", "inherit", "inherit", "ipc"],
+      });
 
-        let taskType: "grant" | "consume";
-        if (opts.mode === "grants") {
-          taskType = "grant";
-        } else if (opts.mode === "consumption") {
-          taskType = "consume";
-        } else {
-          // mixed: 30% grants, 70% consumption
-          taskType = Math.random() < 0.3 ? "grant" : "consume";
+      child.on("message", (msg: { type: string; [key: string]: unknown }) => {
+        if (msg.type === "result") {
+          const r = msg as {
+            type: string;
+            success: boolean;
+            latencyMs: number;
+            errorType?: string;
+            eventType: string;
+            accountId: string;
+          };
+          reporter.record(r.success, r.latencyMs, r.errorType);
+
+          eventBuffer.push({
+            run_id: runId,
+            event_type: r.eventType,
+            account_id: r.accountId,
+            success: r.success,
+            latency_ms: r.latencyMs,
+            error_message: r.errorType,
+          });
+          if (eventBuffer.length >= FLUSH_SIZE) {
+            flushEvents();
+          }
+        } else if (msg.type === "done") {
+          workersCompleted++;
+          if (workersCompleted >= numWorkers) {
+            resolve();
+          }
         }
+      });
 
-        runTask(taskType, account);
-      }
+      child.on("error", (err) => {
+        console.error(`Worker ${w} error: ${err.message}`);
+      });
 
-      setTimeout(tick, delayMs);
-    };
-    tick();
+      child.on("exit", (code) => {
+        if (code !== 0 && code !== null) {
+          console.error(`Worker ${w} exited with code ${code}`);
+        }
+        workersCompleted++;
+        if (workersCompleted >= numWorkers) {
+          resolve();
+        }
+      });
+    }
   });
-
-  // Wait for inflight to drain (max 10s)
-  const drainDeadline = Date.now() + 10000;
-  while (inflight > 0 && Date.now() < drainDeadline) {
-    await new Promise((r) => setTimeout(r, 100));
-  }
 
   // Flush remaining events
   await flushEvents();

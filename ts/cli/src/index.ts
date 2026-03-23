@@ -1,7 +1,16 @@
 import { program } from "commander";
 import { seedCommand } from "./commands/seed.js";
-import { stressCommand } from "./commands/stress.js";
+import { stressCommand, StressMode } from "./commands/stress.js";
 import { metricsCommand } from "./commands/metrics.js";
+
+const VALID_MODES: StressMode[] = [
+  "deposits",
+  "withdrawals",
+  "mixed",
+  "credit-grants",
+  "credit-drawdown",
+  "credit-mixed",
+];
 
 program
   .name("ledger-stress")
@@ -29,17 +38,18 @@ program
   .option("--api-url <url>", "API base URL", "http://localhost:8080")
   .option(
     "--mode <mode>",
-    "Test mode: grants, consumption, or mixed",
+    `Test mode: ${VALID_MODES.join(", ")}`,
     "mixed"
   )
   .option("--concurrency <n>", "Max concurrent requests", "20")
   .option("--duration <seconds>", "Test duration in seconds", "30")
   .option("--rate <rps>", "Target requests per second", "50")
+  .option("--workers <n>", "Number of worker processes", "4")
   .option("--prefix <prefix>", "User ID prefix (must match seed)", "stress")
   .action(async (opts) => {
-    const mode = opts.mode as "grants" | "consumption" | "mixed";
-    if (!["grants", "consumption", "mixed"].includes(mode)) {
-      console.error("Invalid mode. Use: grants, consumption, or mixed");
+    const mode = opts.mode as StressMode;
+    if (!VALID_MODES.includes(mode)) {
+      console.error(`Invalid mode. Use: ${VALID_MODES.join(", ")}`);
       process.exit(1);
     }
     await stressCommand({
@@ -48,6 +58,7 @@ program
       concurrency: parseInt(opts.concurrency),
       duration: parseInt(opts.duration),
       rate: parseInt(opts.rate),
+      workers: parseInt(opts.workers),
       prefix: opts.prefix,
     });
   });

@@ -11,6 +11,7 @@ import (
 
 	"github.com/shihangw/playground-ledger/internal/api"
 	"github.com/shihangw/playground-ledger/internal/config"
+	"github.com/shihangw/playground-ledger/internal/grants"
 	"github.com/shihangw/playground-ledger/internal/ledger"
 	"github.com/shihangw/playground-ledger/internal/wallet"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -41,10 +42,12 @@ func main() {
 	// Initialize services
 	ledgerService := ledger.NewService(pool)
 	walletService := wallet.NewService(pool, ledgerService)
+	grantsService := grants.NewService(pool)
 
 	// Create router
 	router := api.NewRouter(api.RouterConfig{
 		WalletService: walletService,
+		GrantsService: grantsService,
 		Pool:          pool,
 	})
 

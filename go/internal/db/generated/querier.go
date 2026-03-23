@@ -8,21 +8,34 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/shopspring/decimal"
 )
 
 type Querier interface {
 	CreateAccount(ctx context.Context, arg CreateAccountParams) (Account, error)
+	CreateGrant(ctx context.Context, arg CreateGrantParams) (CreditGrant, error)
+	CreateGrantLedgerEntry(ctx context.Context, arg CreateGrantLedgerEntryParams) (GrantLedgerEntry, error)
 	CreateLedgerEntry(ctx context.Context, arg CreateLedgerEntryParams) (LedgerEntry, error)
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) (Transaction, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	CreditAccount(ctx context.Context, arg CreditAccountParams) (Account, error)
 	DebitAccount(ctx context.Context, arg DebitAccountParams) (Account, error)
+	DepleteGrant(ctx context.Context, id pgtype.UUID) error
+	DrawdownGrant(ctx context.Context, arg DrawdownGrantParams) (CreditGrant, error)
+	ExpireActiveGrants(ctx context.Context) (int64, error)
 	GetAccountByID(ctx context.Context, id pgtype.UUID) (Account, error)
 	GetAccountByUserAndCurrency(ctx context.Context, arg GetAccountByUserAndCurrencyParams) (Account, error)
 	GetAccountByUserAndCurrencyForUpdate(ctx context.Context, arg GetAccountByUserAndCurrencyForUpdateParams) (Account, error)
 	GetAccountForUpdate(ctx context.Context, id pgtype.UUID) (Account, error)
 	GetAccountsByUser(ctx context.Context, userID pgtype.UUID) ([]Account, error)
+	GetActiveGrantsByAccount(ctx context.Context, accountID pgtype.UUID) ([]CreditGrant, error)
 	GetAllAccounts(ctx context.Context, arg GetAllAccountsParams) ([]GetAllAccountsRow, error)
+	GetGrantBalance(ctx context.Context, accountID pgtype.UUID) (decimal.Decimal, error)
+	GetGrantByID(ctx context.Context, id pgtype.UUID) (CreditGrant, error)
+	GetGrantByIdempotencyKey(ctx context.Context, idempotencyKey pgtype.UUID) (CreditGrant, error)
+	GetGrantForUpdate(ctx context.Context, id pgtype.UUID) (CreditGrant, error)
+	GetGrantLedgerEntries(ctx context.Context, arg GetGrantLedgerEntriesParams) ([]GrantLedgerEntry, error)
+	GetGrantsByAccount(ctx context.Context, arg GetGrantsByAccountParams) ([]CreditGrant, error)
 	GetLatestLedgerEntry(ctx context.Context, accountID pgtype.UUID) (LedgerEntry, error)
 	GetLedgerEntriesByAccount(ctx context.Context, arg GetLedgerEntriesByAccountParams) ([]LedgerEntry, error)
 	GetLedgerEntriesByTransaction(ctx context.Context, transactionID pgtype.UUID) ([]LedgerEntry, error)

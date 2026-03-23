@@ -3,7 +3,9 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"sync"
 
 	"github.com/shihangw/playground-ledger/internal/wallet"
 	"github.com/shopspring/decimal"
@@ -60,48 +62,81 @@ func (h *AdminHandler) Seed(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	results := make([]SeedResult, 0, req.Count)
-	var errors []string
+	log.Printf("Seeding %d users with prefix %q and balance %s", req.Count, req.Prefix, initialBalance)
+
+	type indexedResult struct {
+		index  int
+		result *SeedResult
+		err    string
+	}
+
+	ch := make(chan indexedResult, req.Count)
+	var wg sync.WaitGroup
+	concurrency := 10
+	sem := make(chan struct{}, concurrency)
 
 	for i := 0; i < req.Count; i++ {
-		extID := fmt.Sprintf("%s_user_%d", req.Prefix, i)
-		email := fmt.Sprintf("%s_user_%d@stress.local", req.Prefix, i)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		user, err := h.walletService.GetOrCreateUser(r.Context(), extID, email)
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("user %d: %v", i, err))
-			continue
-		}
+			extID := fmt.Sprintf("%s_user_%d", req.Prefix, i)
+			email := fmt.Sprintf("%s_user_%d@stress.local", req.Prefix, i)
 
-		accounts, err := h.walletService.GetAccountsByUser(r.Context(), user.ID.Bytes)
-		if err != nil || len(accounts) == 0 {
-			errors = append(errors, fmt.Sprintf("user %d: no accounts", i))
-			continue
-		}
-
-		acc := accounts[0]
-		currentBalance := acc.Balance
-
-		// Top up to initial_balance if current balance is lower
-		if currentBalance.LessThan(initialBalance) {
-			topUp := initialBalance.Sub(currentBalance)
-			idempotencyKey := wallet.SeedIdempotencyKey(extID, initialBalance)
-			_, err = h.walletService.Deposit(r.Context(), acc.ID.Bytes, topUp, idempotencyKey, "Seed top-up")
+			user, err := h.walletService.GetOrCreateUser(r.Context(), extID, email)
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("user %d deposit: %v", i, err))
+				ch <- indexedResult{i, nil, fmt.Sprintf("user %d: %v", i, err)}
+				return
 			}
-		}
 
-		// Re-fetch balance
-		bal, _ := h.walletService.GetBalance(r.Context(), acc.ID.Bytes)
+			accounts, err := h.walletService.GetAccountsByUser(r.Context(), user.ID.Bytes)
+			if err != nil || len(accounts) == 0 {
+				ch <- indexedResult{i, nil, fmt.Sprintf("user %d: no accounts", i)}
+				return
+			}
 
-		results = append(results, SeedResult{
-			ExternalID: extID,
-			Email:      email,
-			AccountID:  uuidToString(acc.ID),
-			Balance:    bal.String(),
-		})
+			acc := accounts[0]
+
+			if acc.Balance.LessThan(initialBalance) {
+				topUp := initialBalance.Sub(acc.Balance)
+				idempotencyKey := wallet.SeedIdempotencyKey(extID, initialBalance)
+				_, err = h.walletService.Deposit(r.Context(), acc.ID.Bytes, topUp, idempotencyKey, "Seed top-up")
+				if err != nil {
+					ch <- indexedResult{i, nil, fmt.Sprintf("user %d deposit: %v", i, err)}
+					return
+				}
+			}
+
+			bal, _ := h.walletService.GetBalance(r.Context(), acc.ID.Bytes)
+
+			ch <- indexedResult{i, &SeedResult{
+				ExternalID: extID,
+				Email:      email,
+				AccountID:  uuidToString(acc.ID),
+				Balance:    bal.String(),
+			}, ""}
+
+			if (i+1)%10 == 0 || i+1 == req.Count {
+				log.Printf("  seeded %d/%d users", i+1, req.Count)
+			}
+		}(i)
 	}
+
+	go func() { wg.Wait(); close(ch) }()
+
+	results := make([]SeedResult, 0, req.Count)
+	var errors []string
+	for r := range ch {
+		if r.err != "" {
+			errors = append(errors, r.err)
+		} else {
+			results = append(results, *r.result)
+		}
+	}
+
+	log.Printf("Seeding complete: %d created, %d errors", len(results), len(errors))
 
 	resp := map[string]interface{}{
 		"created": len(results),
