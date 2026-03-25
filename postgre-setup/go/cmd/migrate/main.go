@@ -26,7 +26,6 @@ func main() {
 	}
 
 	// Connect to database
-	log.Printf("Using DB backend: %s", cfg.DBBackend)
 	db, err := sql.Open("pgx", cfg.ActiveDSN())
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)

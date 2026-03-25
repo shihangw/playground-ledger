@@ -1,13 +1,12 @@
 # Playground Ledger
 
-A scalable, high-performance ledger-based billing system built with Go and CockroachDB, with a React admin dashboard.
+A scalable, high-performance ledger-based billing system built with Go, backed by AlloyDB.
 
 ## Prerequisites
 
 - Go 1.21+
-- Node.js 18+
 - GCP project with Secret Manager enabled
-- CockroachDB cluster (we use CockroachDB Serverless)
+- AlloyDB cluster
 - Service account with `secretmanager.secretAccessor` role
 
 ## Project Structure
@@ -26,153 +25,156 @@ A scalable, high-performance ledger-based billing system built with Go and Cockr
 │   │   │   └── generated/        # sqlc generated code
 │   │   ├── ledger/               # Core ledger operations
 │   │   └── wallet/               # User-facing wallet service
-│   ├── sqlc.yaml                 # sqlc configuration
+│   ├── sqlc.yaml
 │   └── go.mod
 └── ts/
-    └── app/
-        └── site/                 # React admin dashboard (Vite)
+    └── cli/src/                  # Stress test CLI
+        ├── index.ts              # Entry point / command definitions
+        ├── commands/
+        │   ├── seed.ts           # Seed test users
+        │   ├── stress.ts         # Run stress test
+        │   ├── verify.ts         # Correctness tests
+        │   └── metrics.ts        # Query results
+        └── lib/
+            ├── api-client.ts     # HTTP client
+            ├── worker.ts         # Worker process
+            └── reporter.ts       # Live progress output
 ```
 
-## Setup
+## Backend Setup
 
-### Backend (Go)
-
-#### 1. Install dependencies
+### 1. Install dependencies
 
 ```bash
 cd go
 go mod download
 ```
 
-#### 2. Install CLI tools
+### 2. Install CLI tools
 
 ```bash
 go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
 go install github.com/pressly/goose/v3/cmd/goose@latest
 ```
 
-#### 3. Configure secrets in GCP Secret Manager
+### 3. Configure secrets in GCP Secret Manager
 
-Create these secrets in your GCP project (`sw-playground-ledger`):
+Create this secret in your GCP project (`sw-playground-ledger`):
 
 | Secret | Description |
 |--------|-------------|
-| `CRDB_DSN` | CockroachDB connection string |
-| `WORKOS_API_KEY` | WorkOS API key for authentication |
-| `WORKOS_CLIENT_ID` | WorkOS client ID |
+| `ALLOYDB_DSN` | AlloyDB connection string |
 
-Example CRDB_DSN format:
+Example DSN format:
 ```
-postgresql://user:password@host:26257/ledger?sslmode=verify-full
+# AlloyDB (private IP, SSL required)
+postgres://postgres:password@10.46.0.2:5432/postgres?sslmode=require
 ```
 
-#### 4. Set environment variable
+To update a secret value:
+```bash
+echo -n "postgres://..." | gcloud secrets versions add ALLOYDB_DSN --data-file=-
+```
+
+### 4. Set environment variable
 
 ```bash
 export PLAYGROUND_GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 ```
 
-#### 5. Run migrations
+### 5. Set DSN (development)
+
+In development you can set the DSN directly without Secret Manager:
+```bash
+export ALLOYDB_DSN="postgres://postgres:password@10.46.0.2:5432/postgres?sslmode=require"
+```
+
+### 6. Run migrations
 
 ```bash
 cd go
 go run cmd/migrate/main.go -cmd up
 ```
 
-#### 6. Start the API server
+### 7. Start the API server
 
 ```bash
 cd go
 go run cmd/api/main.go
 ```
 
-Server starts on `http://localhost:8080`
+Server starts on `http://localhost:8080`.
 
-### Frontend (React Dashboard)
+---
 
-#### 1. Install dependencies
+## Benchmark (TB-style)
+
+Three scenarios modelled after the [TigerBeetle benchmark](https://docs.tigerbeetle.com). Runs direct-to-AlloyDB — no HTTP server involved.
+
+**Hardware:** AlloyDB N2, 32 vCPU, 256 GB RAM
+**Settings:** `synchronous_commit=off`, `lock_timeout=200ms`, concurrency=32, duration=15s per scenario
+
+### Waterfall evolution
+
+The waterfall scenario (S1) models the real priority order: daily credit → monthly credit → bonus credit → cash. Priority accounts hold $5, cash holds $10 000. Each priority account serves 500 draws ($0.01 each) before depleting; a top-up fires every 500 draws to simulate a credit reset.
+
+| Iteration | Approach | Txns/s | p50 | p99 | p999 |
+|---|---|---|---|---|---|
+| Baseline | `BEGIN … COMMIT` wrapping all 4 accounts every draw | 11 705 | 2.16 ms | 10.90 ms | 22.20 ms |
+| + `depleted_at` | Skip zero-balance accounts via partial index | 11 349 | 2.21 ms | 11.22 ms | 23.79 ms |
+| + Optimistic CTE | Single statement for first account; full waterfall only on miss | **39 690** | **0.57 ms** | **4.83 ms** | **12.89 ms** |
+
+**Optimistic CTE approach:** try the highest-priority account with one auto-committed CTE (`UPDATE … RETURNING` + `INSERT INTO ledger_entries` in the same statement). On success: no explicit `BEGIN`/`COMMIT` overhead. On miss (account depleted or empty): fall back to the standard `BEGIN … COMMIT` waterfall over the remaining accounts. This is the pattern used in production — daily credit covers the vast majority of draws.
+
+### All scenarios (optimistic waterfall)
+
+| Scenario | Description | Txns/s | p50 | p99 | p999 | Errors |
+|---|---|---|---|---|---|---|---|
+| 1 — Waterfall | 4-account groups (daily→monthly→bonus→cash), optimistic CTE | **39 690** | 0.57 ms | 4.83 ms | 12.89 ms | 0 |
+| 2 — Hot account | All 32 goroutines debit the same account | 6 484 | 3.57 ms | 21.21 ms | 32.09 ms | 0 |
+| 3 — Fan-out 1 000 | 1 job = 1 000 pipelined deposits | 78 867 | 408.91 ms | 499.23 ms | 529.21 ms | 0 |
+
+**Key findings:**
+- **Optimistic CTE eliminates explicit transaction overhead** for the common case. A single SQL statement is auto-wrapped by PG internally — 1 round-trip vs 4 (BEGIN + UPDATE + INSERT + COMMIT). 3.5× throughput, 4× better p50.
+- **`depleted_at` partial index** lets the waterfall skip zero-balance accounts without a row lock attempt. Payoff grows over time as priority accounts drain.
+- **Hot-account contention**: row-level locks fully serialise 32 goroutines regardless of transport. Contention is the ceiling, not compute.
+- **Fan-out**: 78k txns/s via pgx pipeline protocol. TigerBeetle achieves ~97k — event-loop batching is ~20% more efficient.
+- Zero errors across all scenarios — `WHERE balance >= $1 AND depleted_at IS NULL` prevents overdraft without constraint violations.
+
+### Running the benchmark
 
 ```bash
-cd ts/app/site
-npm install
+cd postgre-setup/go
+
+# All 3 scenarios
+go run ./cmd/bench/
+
+# Options
+#   --scenario    0=all  1=waterfall  2=hot-account  3=fanout  (default 0)
+#   --concurrency goroutines per scenario                       (default 32)
+#   --duration    per-scenario duration                         (default 15s)
 ```
 
-#### 2. Start development server
-
-```bash
-npm run dev
-```
-
-Dashboard starts on `http://localhost:3000`
-
-#### 3. Build for production
-
-```bash
-npm run build
-```
-
-## API Endpoints
-
-### Health Check
-```bash
-curl http://localhost:8080/health
-```
-
-### Get Accounts (creates user if not exists)
-```bash
-curl http://localhost:8080/v1/accounts \
-  -H "Authorization: Bearer dev_myuser"
-```
-
-### Deposit
-```bash
-curl -X POST http://localhost:8080/v1/accounts/{account_id}/deposit \
-  -H "Authorization: Bearer dev_myuser" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -H "Content-Type: application/json" \
-  -d '{"amount": "100.00"}'
-```
-
-### Withdraw
-```bash
-curl -X POST http://localhost:8080/v1/accounts/{account_id}/withdraw \
-  -H "Authorization: Bearer dev_myuser" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -H "Content-Type: application/json" \
-  -d '{"amount": "25.00"}'
-```
-
-### Transfer
-```bash
-curl -X POST http://localhost:8080/v1/accounts/{account_id}/transfer \
-  -H "Authorization: Bearer dev_myuser" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -H "Content-Type: application/json" \
-  -d '{"to_account_id": "destination-uuid", "amount": "50.00"}'
-```
-
-### Get Transactions
-```bash
-curl http://localhost:8080/v1/accounts/{account_id}/transactions \
-  -H "Authorization: Bearer dev_myuser"
-```
+---
 
 ## Authentication
 
 ### Development
+
 Use `dev_` prefixed tokens for testing:
+
 ```
 Authorization: Bearer dev_testuser123
 ```
 
-The admin dashboard has a token input in the top-right corner for switching users.
-
 ### Production
-Use WorkOS session tokens.
+
+Replace the `dev_` token check in `AuthMiddleware` with your real auth provider (e.g. JWT validation).
 
 ## Idempotency
 
 All mutating operations (POST) require an `Idempotency-Key` header with a UUID:
+
 ```
 Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 ```
@@ -180,8 +182,6 @@ Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 Repeating a request with the same key returns the original response without re-executing.
 
 ## Development Commands
-
-### Backend
 
 ```bash
 cd go
@@ -197,25 +197,69 @@ go run cmd/migrate/main.go -cmd down
 
 # Check migration status
 go run cmd/migrate/main.go -cmd status
+
+# Check database health, version, migrations, and row counts
+go run cmd/dbstatus/main.go
 ```
 
-### Frontend
+---
+
+## AlloyDB Setup (GCP)
+
+The AlloyDB cluster (`playground-ledger`, `us-central1`) is provisioned in the same VPC as the GCE VM and connects directly via private IP.
+
+### Upgrading the instance
 
 ```bash
-cd ts/app/site
-
-# Development server
-npm run dev
-
-# Build
-npm run build
-
-# Type check
-npm run typecheck
+# Scale up CPU (requires instance to be stopped first)
+gcloud alloydb instances update primary \
+  --cluster=playground-ledger \
+  --region=us-central1 \
+  --cpu-count=4 \
+  --project=sw-playground-ledger
 ```
 
-## Admin Dashboard Features
+### Updating the AlloyDB DSN secret
 
-- **Dashboard**: Overview of accounts and balances
-- **Accounts**: View all accounts, deposit/withdraw funds
-- **Transactions**: View transaction history per account
+```bash
+echo -n "postgres://postgres:newpassword@10.46.0.2:5432/postgres?sslmode=require" | \
+  gcloud secrets versions add ALLOYDB_DSN \
+    --data-file=- \
+    --project=sw-playground-ledger
+```
+
+Old secret versions are retained automatically. To see version history:
+
+```bash
+gcloud secrets versions list ALLOYDB_DSN --project=sw-playground-ledger
+```
+
+### Rotating the postgres password
+
+```bash
+# 1. Set a new password on the cluster
+gcloud alloydb users set-password postgres \
+  --cluster=playground-ledger \
+  --region=us-central1 \
+  --password=NEWPASSWORD \
+  --project=sw-playground-ledger
+
+# 2. Update the secret
+echo -n "postgres://postgres:NEWPASSWORD@10.46.0.2:5432/postgres?sslmode=require" | \
+  gcloud secrets versions add ALLOYDB_DSN \
+    --data-file=- \
+    --project=sw-playground-ledger
+```
+
+### Deleting the cluster (teardown)
+
+```bash
+gcloud alloydb instances delete primary \
+  --cluster=playground-ledger \
+  --region=us-central1 \
+  --project=sw-playground-ledger
+
+gcloud alloydb clusters delete playground-ledger \
+  --region=us-central1 \
+  --project=sw-playground-ledger
+```

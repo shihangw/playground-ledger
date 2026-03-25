@@ -12,17 +12,14 @@ import (
 
 // Config holds all application configuration
 type Config struct {
-	// Database — both DSNs are populated; ActiveDSN() returns the selected one.
-	// Switch backends by setting DB_BACKEND=alloydb (default) or DB_BACKEND=crdb.
-	CRDBDSN    string
+	// Database
 	AlloyDBDSN string
-	DBBackend  string // "alloydb" | "crdb"
-	DBPoolSize int    // max connections in the pool (DB_POOL_SIZE, default 600)
-	DBMinConns int    // min warm connections (DB_MIN_CONNS, default 10)
+	DBPoolSize int // max connections in the pool (DB_POOL_SIZE, default 600)
+	DBMinConns int // min warm connections (DB_MIN_CONNS, default 10)
 
-	// DB_POOL_DSN: if set, overrides the backend DSN with a connection pooler endpoint
+	// DB_POOL_DSN: if set, overrides AlloyDBDSN with a connection pooler endpoint
 	// (e.g. AlloyDB's built-in pgBouncer). Also enables simple-protocol mode.
-	DBPoolDSN      string
+	DBPoolDSN        string
 	DBSimpleProtocol bool // use PostgreSQL simple query protocol (required for pgBouncer transaction mode)
 
 	// Server
@@ -31,16 +28,13 @@ type Config struct {
 	ProjectID   string
 }
 
-// ActiveDSN returns the DSN for the currently selected backend.
+// ActiveDSN returns the DSN to connect with.
 // If DB_POOL_DSN is set, it takes precedence (points at the connection pooler).
 func (c *Config) ActiveDSN() string {
 	if c.DBPoolDSN != "" {
 		return c.DBPoolDSN
 	}
-	if c.DBBackend == "alloydb" {
-		return c.AlloyDBDSN
-	}
-	return c.CRDBDSN
+	return c.AlloyDBDSN
 }
 
 // Load loads configuration from environment and GCP Secret Manager
@@ -61,7 +55,6 @@ func Load(ctx context.Context) (*Config, error) {
 		Port:             getEnv("PORT", "8080"),
 		Environment:      getEnv("ENV", "development"),
 		ProjectID:        getEnv("GCP_PROJECT_ID", "sw-playground-ledger"),
-		DBBackend:        getEnv("DB_BACKEND", "alloydb"),
 		DBPoolSize:       poolSize,
 		DBMinConns:       minConns,
 		DBPoolDSN:        os.Getenv("DB_POOL_DSN"),
@@ -75,9 +68,7 @@ func Load(ctx context.Context) (*Config, error) {
 
 	// In development, allow loading from environment variables directly
 	if cfg.Environment == "development" {
-		cfg.CRDBDSN = os.Getenv("CRDB_DSN")
 		cfg.AlloyDBDSN = os.Getenv("ALLOYDB_DSN")
-
 		if cfg.ActiveDSN() != "" {
 			return cfg, nil
 		}
@@ -90,13 +81,6 @@ func Load(ctx context.Context) (*Config, error) {
 	}
 	defer client.Close()
 
-	// Load CRDB DSN
-	cfg.CRDBDSN, err = getSecret(ctx, client, cfg.ProjectID, "CRDB_DSN")
-	if err != nil {
-		return nil, fmt.Errorf("failed to load CRDB_DSN: %w", err)
-	}
-
-	// Load AlloyDB DSN
 	cfg.AlloyDBDSN, err = getSecret(ctx, client, cfg.ProjectID, "ALLOYDB_DSN")
 	if err != nil {
 		return nil, fmt.Errorf("failed to load ALLOYDB_DSN: %w", err)

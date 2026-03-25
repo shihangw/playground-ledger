@@ -1,0 +1,23 @@
+# Go binary (built by `go build .`)
+tigerbeetle-setup
+
+# Test/benchmark output
+*.out
+*.test
+
+# TigerBeetle data files (created by docker volume or local runs)
+*.tigerbeetle
+
+# Docker volumes / local data dirs
+data/
+backups/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

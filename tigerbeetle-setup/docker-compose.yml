@@ -1,0 +1,186 @@
+version: "3.9"
+
+# =============================================================================
+# TigerBeetle stack — LavinMQ edition
+#
+# Pipeline:
+#   TigerBeetle ──► tigerbeetle-cdc ──► LavinMQ ──► ClickHouse
+#
+# Services:
+#   tigerbeetle      - OLTP financial ledger
+#   lavinmq          - AMQP 0.9.1 broker (drop-in RabbitMQ replacement, ~10x throughput)
+#   tigerbeetle-cdc  - Streams every transfer event to LavinMQ via tigerbeetle amqp
+#   clickhouse       - OLAP, consumes from LavinMQ via RabbitMQ table engine
+#   backup           - Periodic snapshot of TigerBeetle data file
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # TigerBeetle
+  # ---------------------------------------------------------------------------
+  tigerbeetle:
+    build:
+      context: ./tigerbeetle
+    container_name: tigerbeetle-dev
+    privileged: true
+    volumes:
+      - tb-data:/data
+    ports:
+      - "3000:3000"
+    environment:
+      TB_CLUSTER: "${TB_CLUSTER:-0}"
+      TB_REPLICA: "0"
+      TB_REPLICA_COUNT: "1"
+      TB_ADDRESSES: "0.0.0.0:3000"
+      TB_DEVELOPMENT: "false"
+    networks:
+      - ledger
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/3000' 2>/dev/null && echo ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # LavinMQ — high-throughput AMQP 0.9.1 broker
+  # Management UI → http://localhost:15672  (guest / guest)
+  # ---------------------------------------------------------------------------
+  lavinmq:
+    image: cloudamqp/lavinmq:latest
+    container_name: lavinmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI → http://localhost:15672
+    volumes:
+      - lavinmq-data:/var/lib/lavinmq
+    networks:
+      - ledger
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "lavinmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Setup — one-shot: declares the tigerbeetle fanout exchange on LavinMQ.
+  # tigerbeetle amqp does a passive declare and errors if the exchange is absent.
+  # ---------------------------------------------------------------------------
+  setup:
+    image: alpine/curl:latest
+    container_name: ledger-setup
+    depends_on:
+      lavinmq:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo "Declaring tigerbeetle exchange on LavinMQ..."
+        curl -sf -u guest:guest \
+          -X PUT http://lavinmq:15672/api/exchanges/%2F/tigerbeetle \
+          -H "Content-Type: application/json" \
+          -d '{"type":"fanout","durable":true,"auto_delete":false}' \
+          && echo "Exchange ready."
+    networks:
+      - ledger
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # TigerBeetle CDC sidecar — `tigerbeetle amqp` → LavinMQ
+  # Stateless: resumes from last ack'd event on restart.
+  # ---------------------------------------------------------------------------
+  tigerbeetle-cdc:
+    build:
+      context: ./cdc-sidecar
+    container_name: tigerbeetle-cdc
+    privileged: true
+    depends_on:
+      tigerbeetle:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    environment:
+      TB_ADDRESSES: "tigerbeetle:3000"
+      TB_CLUSTER: "${TB_CLUSTER:-0}"
+      AMQP_HOST: "lavinmq"
+      AMQP_PORT: "5672"
+      AMQP_VHOST: "/"
+      AMQP_USER: "guest"
+      AMQP_PASS: "guest"
+      AMQP_EXCHANGE: "tigerbeetle"
+      EVENT_COUNT_MAX: "2730"
+      IDLE_INTERVAL_MS: "1000"
+    networks:
+      - ledger
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse — OLAP, RabbitMQ engine consumes from LavinMQ
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    container_name: clickhouse
+    depends_on:
+      lavinmq:
+        condition: service_healthy
+    ports:
+      - "8123:8123"   # HTTP  → curl "http://localhost:8123/?query=SELECT..."
+      - "9000:9000"   # Native TCP (DBeaver, clickhouse-client)
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+    environment:
+      CLICKHOUSE_DB: tigerbeetle
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-default}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-}"
+    networks:
+      - ledger
+    restart: unless-stopped
+    healthcheck:
+      test: wget -qO- http://127.0.0.1:8123/ping || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Backup — periodic snapshot of the TigerBeetle data file
+  # Mounts the data volume read-only; optionally uploads to S3.
+  # ---------------------------------------------------------------------------
+  backup:
+    build:
+      context: ./backup
+    container_name: tigerbeetle-backup
+    depends_on:
+      - tigerbeetle
+    volumes:
+      - tb-data:/data:ro
+      - tb-backups:/backups
+    environment:
+      DATA_DIR: "/data"
+      BACKUP_DIR: "/backups"
+      BACKUP_INTERVAL: "${BACKUP_INTERVAL:-3600}"
+      BACKUP_RETAIN: "${BACKUP_RETAIN:-24}"
+      BACKUP_S3_BUCKET: "${BACKUP_S3_BUCKET:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
+    networks:
+      - ledger
+    restart: unless-stopped
+
+# =============================================================================
+volumes:
+  tb-data:
+  tb-backups:
+  lavinmq-data:
+  clickhouse-data:
+
+networks:
+  ledger:
+    driver: bridge

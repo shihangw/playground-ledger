@@ -20,8 +20,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	fmt.Printf("Backend:     %s\n", cfg.DBBackend)
-	fmt.Printf("Active DSN:  %s\n", maskDSN(cfg.ActiveDSN()))
+	fmt.Printf("DSN:         %s\n", maskDSN(cfg.ActiveDSN()))
 	fmt.Println()
 
 	db, err := sql.Open("pgx", cfg.ActiveDSN())

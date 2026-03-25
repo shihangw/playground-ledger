@@ -28,7 +28,6 @@ func main() {
 	}
 
 	// Connect to database
-	log.Printf("Using DB backend: %s", cfg.DBBackend)
 	if cfg.DBPoolDSN != "" {
 		log.Printf("Using connection pooler DSN (DB_POOL_DSN)")
 	}
@@ -42,16 +41,13 @@ func main() {
 		poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 		log.Printf("Using simple query protocol (pgBouncer transaction mode)")
 	}
-	// Set session settings for Postgres/AlloyDB only (CRDB uses OCC and doesn't support these).
 	// synchronous_commit=off: skip WAL flush wait per commit — roughly doubles write throughput.
 	// Data is still written to WAL; at most ~200ms of commits can be lost on a crash.
-	if cfg.DBBackend == "alloydb" || cfg.DBBackend == "postgres" {
-		poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			_, err := conn.Exec(ctx, "SET lock_timeout = '200ms'; SET synchronous_commit = off")
-			return err
-		}
-		log.Printf("lock_timeout=200ms, synchronous_commit=off enabled")
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SET lock_timeout = '200ms'; SET synchronous_commit = off")
+		return err
 	}
+	log.Printf("lock_timeout=200ms, synchronous_commit=off enabled")
 	log.Printf("Pool max_conns=%d min_conns=%d", poolCfg.MaxConns, poolCfg.MinConns)
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -63,9 +59,9 @@ func main() {
 	pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer pingCancel()
 	if err := pool.Ping(pingCtx); err != nil {
-		log.Fatalf("Failed to ping database (%s): %v", cfg.DBBackend, err)
+		log.Fatalf("Failed to ping database: %v", err)
 	}
-	log.Printf("Connected to database (%s)", cfg.DBBackend)
+	log.Printf("Connected to AlloyDB")
 
 	// Log pool stats every 5 seconds so we can see connection pressure
 	go func() {
