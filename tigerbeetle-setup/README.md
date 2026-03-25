@@ -1,8 +1,8 @@
 # tigerbeetle-setup
 
-Benchmarks and correctness tests for TigerBeetle, with Cloud SQL as a metadata store.
+Benchmarks and correctness tests for TigerBeetle, with PostgreSQL as a metadata store.
 
-## Benchmark: TigerBeetle + Cloud SQL (PostgreSQL)
+## Benchmark: TigerBeetle + PostgreSQL (local container)
 
 > **Txns/s** = complete business transactions per second (1 waterfall draw = 1 txn; 1 fan-out to 1 000 recipients = 1 000 txns). All latency columns are **per transaction**.
 
@@ -10,25 +10,25 @@ Benchmarks and correctness tests for TigerBeetle, with Cloud SQL as a metadata s
 
 | Scenario | Variant | Txns/s | p50 | p99 | max |
 |---|---|---|---|---|---|
-| 1. Waterfall (batch=8) | TB only | 7 654 | 1.9 ms | 29.8 ms | 52.5 ms |
-| 1. Waterfall (batch=8) | PG → TB | 6 739 | 1.9 ms | 31.9 ms | 242.6 ms |
-| 1. Waterfall | Optimistic | 3 649 | 3.7 ms | 122.4 ms | 915.0 ms |
-| 1. Waterfall | Opt PG→TB | 2 127 | 7.9 ms | 165.3 ms | 1 168.6 ms |
-| 2. Hot withdrawal | TB only | 5 753 | 3.6 ms | 31.2 ms | 206.8 ms |
-| 2. Hot withdrawal | PG → TB | 4 701 | 5.2 ms | 49.4 ms | 144.2 ms |
-| 3. Fan-out→1000 | TB only | 107 391 | 222 µs | 956 µs | 970 µs |
-| 3. Fan-out→1000 | PG → TB | 99 852 | 297 µs | 872 µs | 896 µs |
+| 1. Waterfall (batch=8) | TB only | 20 064 | 382 µs | 20.2 ms | 41.5 ms |
+| 1. Waterfall (batch=8) | PG → TB | 13 731 | 422 µs | 24.9 ms | 100.0 ms |
+| 1. Waterfall | Optimistic | 11 347 | 660 µs | 53.5 ms | 340.9 ms |
+| 1. Waterfall | Opt PG→TB | 5 032 | 2.3 ms | 95.9 ms | 603.0 ms |
+| 2. Hot withdrawal | TB only | 16 174 | 637 µs | 23.2 ms | 417.9 ms |
+| 2. Hot withdrawal | PG → TB | 12 150 | 1.2 ms | 35.9 ms | 372.6 ms |
+| 3. Fan-out→1000 | TB only | 206 234 | 136 µs | 698 µs | 719 µs |
+| 3. Fan-out→1000 | PG → TB | 161 926 | 183 µs | 670 µs | 718 µs |
 
-**Cloud SQL metadata overhead:**
+**Local Postgres container overhead:**
 
 | Scenario | PG query | p50 delta | Throughput delta |
 |---|---|---|---|
-| Waterfall (batch=8) | `SELECT` 32 rows, `ANY($8)` | 0 ms | −12% |
-| Waterfall (Optimistic) | `SELECT` 4 rows, `ORDER BY priority` | +4.2 ms | −42% |
-| Hot withdrawal | `SELECT` 1 row, index scan | +1.6 ms | −18% |
-| Fan-out | `SELECT` 1 000 rows, `ANY($1000)` | +75 µs/txn | −7% |
+| Waterfall (batch=8) | `SELECT` 32 rows, `ANY($8)` | +40 µs | −32% |
+| Waterfall (Optimistic) | `SELECT` 4 rows, `ORDER BY priority` | +1.6 ms | −56% |
+| Hot withdrawal | `SELECT` 1 row, index scan | +0.6 ms | −25% |
+| Fan-out | `SELECT` 1 000 rows, `ANY($1000)` | +47 µs/txn | −21% |
 
-On the SSD the TB event loop is faster, so the PG RTT is a larger fraction of total op time. The staging benefit that appeared on `pd-standard` disappears — faster TB means goroutines spend proportionally less time queuing at the event loop, so staggering arrivals no longer helps.
+On NVMe the TB event loop is substantially faster than on `pd-standard`, so even local Postgres container latency (~0.1 ms RTT) becomes a larger fraction of total op time — the overhead percentage is higher than the Cloud SQL numbers despite lower absolute RTT.
 
 ---
 
@@ -36,19 +36,19 @@ On the SSD the TB event loop is faster, so the PG RTT is a larger fraction of to
 
 | Variant | Txns/s | p50 | p99 | max |
 |---|---|---|---|---|
-| TB only (batch=8) | 7 654 | 1.9 ms | 29.8 ms | 52.5 ms |
-| PG → TB (batch=8) | 6 739 | 1.9 ms | 31.9 ms | 242.6 ms |
-| Optimistic | 3 649 | 3.7 ms | 122.4 ms | 915.0 ms |
-| Opt PG→TB | 2 127 | 7.9 ms | 165.3 ms | 1 168.6 ms |
+| TB only (batch=8) | 20 064 | 382 µs | 20.2 ms | 41.5 ms |
+| PG → TB (batch=8) | 13 731 | 422 µs | 24.9 ms | 100.0 ms |
+| Optimistic | 11 347 | 660 µs | 53.5 ms | 340.9 ms |
+| Opt PG→TB | 5 032 | 2.3 ms | 95.9 ms | 603.0 ms |
 
-**Why batch=8 beats Optimistic on throughput:** batch=8 amortises one TB round-trip across 8 txns (→ 1.9 ms p50). The Optimistic path pays one round-trip per txn (→ 3.7 ms p50). The wide Optimistic p99 (122 ms) reflects the full 7-transfer fallback chain firing when A cascades to B or C. For a single end-user transaction in isolation, Optimistic is the lower-latency choice when A is funded.
+**Why batch=8 beats Optimistic on throughput:** batch=8 amortises one TB round-trip across 8 txns (→ 382 µs p50). The Optimistic path pays one round-trip per txn (→ 660 µs p50). The wide Optimistic p99 (53.5 ms) reflects the full 7-transfer fallback chain firing when A cascades to B or C. For a single end-user transaction in isolation, Optimistic is the lower-latency choice when A is funded.
 
 **Effect of batching — full chain:**
 
 | Batch | Txns/s | p50/txn |
 |---|---|---|
 | 1 (unbatched) | ~2 600 | ~5 ms |
-| **8 (default)** | **7 654** | **1.9 ms** |
+| **8 (default)** | **20 064** | **382 µs** |
 
 ---
 
@@ -56,10 +56,10 @@ On the SSD the TB event loop is faster, so the PG RTT is a larger fraction of to
 
 | Variant | Txns/s | p50 | p99 | max |
 |---|---|---|---|---|
-| TB only | 5 753 | 3.6 ms | 31.2 ms | 206.8 ms |
-| PG → TB | 4 701 | 5.2 ms | 49.4 ms | 144.2 ms |
+| TB only | 16 174 | 637 µs | 23.2 ms | 417.9 ms |
+| PG → TB | 12 150 | 1.2 ms | 35.9 ms | 372.6 ms |
 
-TigerBeetle sustains ~5 700 ops/s under 32-goroutine contention on a single account with no errors. A PostgreSQL ledger under the same load would serialise all 32 goroutines behind a row lock.
+TigerBeetle sustains ~16 000 ops/s under 32-goroutine contention on a single account with no errors. A PostgreSQL ledger under the same load would serialise all 32 goroutines behind a row lock.
 
 ---
 
@@ -67,10 +67,10 @@ TigerBeetle sustains ~5 700 ops/s under 32-goroutine contention on a single acco
 
 | Variant | Txns/s | p50/txn | p99/txn | max/txn |
 |---|---|---|---|---|
-| TB only | 107 391 | 222 µs | 956 µs | 970 µs |
-| PG → TB | 99 852 | 297 µs | 872 µs | 896 µs |
+| TB only | 206 234 | 136 µs | 698 µs | 719 µs |
+| PG → TB | 161 926 | 183 µs | 670 µs | 718 µs |
 
-Per-txn latency stays sub-millisecond in both variants — the 1 000-transfer batch amortises the TB round-trip to ~220 µs per recipient. Cache payee IDs in the application layer to eliminate the −7% PG overhead.
+Per-txn latency stays sub-millisecond in both variants — the 1 000-transfer batch amortises the TB round-trip to ~136 µs per recipient on NVMe. Cache payee IDs in the application layer to eliminate the −21% PG overhead.
 
 ---
 
@@ -79,14 +79,14 @@ Per-txn latency stays sub-millisecond in both variants — the 1 000-transfer ba
 ```bash
 go run ./bench \
   --tb-address 127.0.0.1:3000 \
-  --pg-dsn "postgres://postgres:PASSWORD@10.46.1.3/ledger_bench" \
+  --pg-dsn "postgres://postgres:bench@172.18.0.7/ledger_bench" \
   --duration 15s \
   --concurrency 32 \
   --fanout-dests 1000 \
   --waterfall-batch 8
 ```
 
-Cloud SQL instance: `ledger-bench-pg` (`us-central1`, private IP `10.46.1.3`).
+PostgreSQL: local Docker container (`bench-pg`) on the `ledger` bridge network.
 
 ---
 
@@ -98,22 +98,22 @@ Cloud SQL instance: `ledger-bench-pg` (`us-central1`, private IP `10.46.1.3`).
 |---|---|
 | TigerBeetle | Single-node Docker container, same VM |
 | VM | GCP `e2-standard-4` (4 vCPU / 16 GB), `us-central1-a` |
-| Storage | 100 GB SSD persistent disk (`ssddisk-20260325-182823`), mounted at `/mnt/ssd` |
-| Cloud SQL | `db-custom-2-8192` ENTERPRISE, Postgres 16, `us-central1`, private IP `10.46.1.3` |
-| Network (PG) | Same-region VPC private IP, ~0.3 ms base RTT |
+| Storage | 375 GB local NVMe SSD (`nvme0n1`), mounted at `~/ssd` |
+| PostgreSQL | Docker container (`bench-pg`, Postgres 16), same VM, `ledger` bridge network |
+| Network (PG) | Localhost bridge (~0.1 ms base RTT) |
 | Concurrency | 32 goroutines, 15 s per scenario |
 
-Each scenario runs two variants: **TB only** (account IDs hardcoded, no PG) and **PG → TB** (account IDs fetched from Cloud SQL per op).
+Each scenario runs two variants: **TB only** (account IDs hardcoded, no PG) and **PG → TB** (account IDs fetched from Postgres per op).
 
 **Architecture:**
 
 ```
 Application
     │
-    ├─► Cloud SQL PostgreSQL  — account metadata (user → TB account IDs, priority)
+    ├─► PostgreSQL (local)  — account metadata (user → TB account IDs, priority)
     │       user_accounts(user_id, account_id, priority)
     │
-    └─► TigerBeetle           — financial ledger (all balances, every transfer)
+    └─► TigerBeetle         — financial ledger (all balances, every transfer)
 ```
 
 **Scenario 1 — Waterfall account setup (1 unit = $0.10):**
@@ -139,7 +139,7 @@ Each priority account serves exactly 50 draws before depleting. Top-up fires eve
 
 ## Throughput ceiling and hardware path
 
-The benchmark above runs on a single-node Docker container backed by a **GCP `pd-standard` persistent disk**. The observed ~7 000 Txns/s (waterfall) and ~100 k Txns/s (fan-out) ceilings are primarily an I/O artifact, not a TigerBeetle design limit.
+The benchmark above runs on a single-node Docker container backed by a **local NVMe SSD**. The observed ~20 k Txns/s (waterfall) and ~206 k Txns/s (fan-out) reflect the NVMe `fsync` latency floor, not a TigerBeetle design limit.
 
 ### Why `fsync` is the bottleneck
 
@@ -147,9 +147,9 @@ TigerBeetle commits every batch to disk before acknowledging clients. On this VM
 
 | Storage | `fsync` latency | Approx. TB throughput |
 |---|---|---|
-| `pd-standard` (this benchmark) | ~1–2 ms | ~50–100 k transfers/s |
+| `pd-standard` | ~1–2 ms | ~50–100 k transfers/s |
 | `pd-ssd` | ~0.5 ms | ~200 k transfers/s |
-| Local NVMe SSD | ~50–100 µs | ~500 k–1 M transfers/s |
+| **Local NVMe SSD (this benchmark)** | **~50–100 µs** | **~200–500 k transfers/s** |
 | Bare-metal NVMe | ~20–50 µs | 1 M+ transfers/s (TB published figure) |
 
 Each doubling of `fsync` speed roughly doubles TB throughput because the event loop spends the majority of its wall time waiting for the storage acknowledgement.
@@ -170,7 +170,7 @@ Local SSDs are ephemeral — data is lost if the VM stops. The production soluti
 
 **Latency trade-off:** the primary must wait for 2/3 nodes to `fsync` before committing (adds one cross-node RTT, ~0.5–1 ms intra-zone). Net result is still far faster than a single node on `pd-standard`.
 
-**Batching and the ceiling:** increasing `--waterfall-batch` beyond 8 gives diminishing returns on this VM (~+15% from 8→128) because the batch of 32 concurrent goroutines already saturates the ~50 k transfers/s storage ceiling. On NVMe the ceiling shifts to ~500 k transfers/s, making larger batches worthwhile again.
+**Batching and the ceiling:** on NVMe the storage ceiling shifts to ~500 k transfers/s, so increasing `--waterfall-batch` beyond 8 has more room to help. The current 32-goroutine waterfall result (~20 k Txns/s × 7 transfers = ~140 k transfers/s) is well below the NVMe ceiling — the bottleneck is now the linked-chain serialisation cost, not storage.
 
 ---
 
@@ -280,7 +280,7 @@ Connected to TigerBeetle at 127.0.0.1:3000 (cluster 0)
   ✓ target of 50000 TPS met
 ```
 
-| Mode | Max batch | Observed TPS (GCP VM) |
+| Mode | Max batch | Observed TPS (NVMe VM) |
 |------|-----------|----------------------|
 | `--development` | 253 | ~40k |
-| production (default) | 8189 | ~100k |
+| production (default) | 8189 | ~278k |
