@@ -116,6 +116,28 @@ func (m *pgWaterfallMeta) lookupAccounts(ctx context.Context, pool *pgxpool.Pool
 	return chainIDs, rows.Err()
 }
 
+// lookupFirstChain returns the 4 source account IDs for the first user in priority
+// order. Used as the fallback after a failed optimistic attempt.
+func (m *pgWaterfallMeta) lookupFirstChain(ctx context.Context, pool *pgxpool.Pool) ([]int64, error) {
+	rows, err := pool.Query(ctx,
+		"SELECT account_id FROM user_accounts WHERE user_id = $1 ORDER BY priority",
+		m.userIDs[0],
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ── Scenario 2: Hot account withdrawal ───────────────────────────────────────
 //
 // One "hot user" owns one primary account (priority 0).

@@ -215,11 +215,15 @@ func (c *collector) result(name string, dur time.Duration) scenarioResult {
 //
 // The entire cascade is a single BEGIN…COMMIT — exactly 1 DB transaction per draw.
 
+// 1 unit = $0.10
+// A/B/C: 50 units ($5) each — deplete after 50 draws
+// D (cash): 1 000 000 units ($100 000) — safety net, never topped up
+// Top-up resets A/B/C to $5 every 150 draws (= 3 × 50, one full cascade cycle)
 const (
-	waterfallDebitAmt   = "0.01"
-	waterfallSmallBal   = "5"     // daily / monthly / bonus credit
-	waterfallCashBal    = "10000" // cash — never depletes during the bench
-	waterfallTopupEvery = 500     // top up priority accounts every N draws
+	waterfallDebitAmt   = "0.10"
+	waterfallSmallBal   = "5"      // 50 units × $0.10
+	waterfallCashBal    = "100000" // 1 000 000 units × $0.10
+	waterfallTopupEvery = 150      // 3 accounts × 50 draws per cycle
 )
 
 // waterfallOptimisticSQL tries the first-priority account with a single
@@ -468,16 +472,15 @@ func printResults(results []scenarioResult) {
 		fmt.Printf("\n%s\n", r.name)
 		fmt.Printf("  Duration: %.0fs\n\n", r.duration.Seconds())
 
-		p50 := pct(r.lats, 50)
 		p99 := pct(r.lats, 99)
-		p999 := pct(r.lats, 99.9)
+		max := pct(r.lats, 100)
 
-		fmt.Printf("  %-10s %-12s %-12s %-10s %-10s %-10s %-8s\n",
-			"Jobs", "Jobs/s", "Txns/s", "p50", "p99", "p999", "Errors")
-		fmt.Println("  " + strings.Repeat("─", 66))
-		fmt.Printf("  %-10d %-12.0f %-12.0f %-10s %-10s %-10s %-8d\n",
+		fmt.Printf("  %-10s %-12s %-12s %-10s %-10s %-8s\n",
+			"Jobs", "Jobs/s", "Txns/s", "p99", "max", "Errors")
+		fmt.Println("  " + strings.Repeat("─", 62))
+		fmt.Printf("  %-10d %-12.0f %-12.0f %-10s %-10s %-8d\n",
 			r.jobs, r.jobsPerSec(), r.txnsPerSec(),
-			fmtMs(p50), fmtMs(p99), fmtMs(p999), r.errors)
+			fmtMs(p99), fmtMs(max), r.errors)
 	}
 
 	fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

@@ -1,23 +1,197 @@
 # tigerbeetle-setup
 
-Verify a local TigerBeetle instance works and measure throughput before wiring up sidecars.
+Benchmarks and correctness tests for TigerBeetle, with Cloud SQL as a metadata store.
 
-## Prerequisites
+## Benchmark: TigerBeetle + Cloud SQL (PostgreSQL)
+
+> **Txns/s** = complete business transactions per second (1 waterfall draw = 1 txn; 1 fan-out to 1 000 recipients = 1 000 txns). All latency columns are **per transaction**.
+
+### Results summary
+
+| Scenario | Variant | Txns/s | p50 | p99 | max |
+|---|---|---|---|---|---|
+| 1. Waterfall (batch=8) | TB only | 7 654 | 1.9 ms | 29.8 ms | 52.5 ms |
+| 1. Waterfall (batch=8) | PG → TB | 6 739 | 1.9 ms | 31.9 ms | 242.6 ms |
+| 1. Waterfall | Optimistic | 3 649 | 3.7 ms | 122.4 ms | 915.0 ms |
+| 1. Waterfall | Opt PG→TB | 2 127 | 7.9 ms | 165.3 ms | 1 168.6 ms |
+| 2. Hot withdrawal | TB only | 5 753 | 3.6 ms | 31.2 ms | 206.8 ms |
+| 2. Hot withdrawal | PG → TB | 4 701 | 5.2 ms | 49.4 ms | 144.2 ms |
+| 3. Fan-out→1000 | TB only | 107 391 | 222 µs | 956 µs | 970 µs |
+| 3. Fan-out→1000 | PG → TB | 99 852 | 297 µs | 872 µs | 896 µs |
+
+**Cloud SQL metadata overhead:**
+
+| Scenario | PG query | p50 delta | Throughput delta |
+|---|---|---|---|
+| Waterfall (batch=8) | `SELECT` 32 rows, `ANY($8)` | 0 ms | −12% |
+| Waterfall (Optimistic) | `SELECT` 4 rows, `ORDER BY priority` | +4.2 ms | −42% |
+| Hot withdrawal | `SELECT` 1 row, index scan | +1.6 ms | −18% |
+| Fan-out | `SELECT` 1 000 rows, `ANY($1000)` | +75 µs/txn | −7% |
+
+On the SSD the TB event loop is faster, so the PG RTT is a larger fraction of total op time. The staging benefit that appeared on `pd-standard` disappears — faster TB means goroutines spend proportionally less time queuing at the event loop, so staggering arrivals no longer helps.
+
+---
+
+### Scenario 1 — Waterfall withdrawal
+
+| Variant | Txns/s | p50 | p99 | max |
+|---|---|---|---|---|
+| TB only (batch=8) | 7 654 | 1.9 ms | 29.8 ms | 52.5 ms |
+| PG → TB (batch=8) | 6 739 | 1.9 ms | 31.9 ms | 242.6 ms |
+| Optimistic | 3 649 | 3.7 ms | 122.4 ms | 915.0 ms |
+| Opt PG→TB | 2 127 | 7.9 ms | 165.3 ms | 1 168.6 ms |
+
+**Why batch=8 beats Optimistic on throughput:** batch=8 amortises one TB round-trip across 8 txns (→ 1.9 ms p50). The Optimistic path pays one round-trip per txn (→ 3.7 ms p50). The wide Optimistic p99 (122 ms) reflects the full 7-transfer fallback chain firing when A cascades to B or C. For a single end-user transaction in isolation, Optimistic is the lower-latency choice when A is funded.
+
+**Effect of batching — full chain:**
+
+| Batch | Txns/s | p50/txn |
+|---|---|---|
+| 1 (unbatched) | ~2 600 | ~5 ms |
+| **8 (default)** | **7 654** | **1.9 ms** |
+
+---
+
+### Scenario 2 — Hot account withdrawal
+
+| Variant | Txns/s | p50 | p99 | max |
+|---|---|---|---|---|
+| TB only | 5 753 | 3.6 ms | 31.2 ms | 206.8 ms |
+| PG → TB | 4 701 | 5.2 ms | 49.4 ms | 144.2 ms |
+
+TigerBeetle sustains ~5 700 ops/s under 32-goroutine contention on a single account with no errors. A PostgreSQL ledger under the same load would serialise all 32 goroutines behind a row lock.
+
+---
+
+### Scenario 3 — Fan-out to 1 000 accounts
+
+| Variant | Txns/s | p50/txn | p99/txn | max/txn |
+|---|---|---|---|---|
+| TB only | 107 391 | 222 µs | 956 µs | 970 µs |
+| PG → TB | 99 852 | 297 µs | 872 µs | 896 µs |
+
+Per-txn latency stays sub-millisecond in both variants — the 1 000-transfer batch amortises the TB round-trip to ~220 µs per recipient. Cache payee IDs in the application layer to eliminate the −7% PG overhead.
+
+---
+
+### Re-running
+
+```bash
+go run ./bench \
+  --tb-address 127.0.0.1:3000 \
+  --pg-dsn "postgres://postgres:PASSWORD@10.46.1.3/ledger_bench" \
+  --duration 15s \
+  --concurrency 32 \
+  --fanout-dests 1000 \
+  --waterfall-batch 8
+```
+
+Cloud SQL instance: `ledger-bench-pg` (`us-central1`, private IP `10.46.1.3`).
+
+---
+
+### Benchmark setup
+
+**Infrastructure:**
+
+| Component | Detail |
+|---|---|
+| TigerBeetle | Single-node Docker container, same VM |
+| VM | GCP `e2-standard-4` (4 vCPU / 16 GB), `us-central1-a` |
+| Storage | 100 GB SSD persistent disk (`ssddisk-20260325-182823`), mounted at `/mnt/ssd` |
+| Cloud SQL | `db-custom-2-8192` ENTERPRISE, Postgres 16, `us-central1`, private IP `10.46.1.3` |
+| Network (PG) | Same-region VPC private IP, ~0.3 ms base RTT |
+| Concurrency | 32 goroutines, 15 s per scenario |
+
+Each scenario runs two variants: **TB only** (account IDs hardcoded, no PG) and **PG → TB** (account IDs fetched from Cloud SQL per op).
+
+**Architecture:**
+
+```
+Application
+    │
+    ├─► Cloud SQL PostgreSQL  — account metadata (user → TB account IDs, priority)
+    │       user_accounts(user_id, account_id, priority)
+    │
+    └─► TigerBeetle           — financial ledger (all balances, every transfer)
+```
+
+**Scenario 1 — Waterfall account setup (1 unit = $0.10):**
+
+| Account | Balance | Role | Top-up |
+|---|---|---|---|
+| Daily credit (A) | 50 units ($5) | first priority | +50 every 150 draws |
+| Monthly credit (B) | 50 units ($5) | fallback once A depleted | +50 every 150 draws |
+| Bonus credit (C) | 50 units ($5) | fallback once A+B depleted | +50 every 150 draws |
+| Cash (D) | 1 000 000 units ($100 000) | safety net | never depleted |
+
+Each priority account serves exactly 50 draws before depleting. Top-up fires every 150 draws, so one cycle covers A (draws 1–50) → B (51–100) → C (101–150) → D (remainder), exercising all 4 accounts every cycle.
+
+**TB recipe — full chain:** 7-transfer linked sequence ([Balancing Debits recipe](https://docs.tigerbeetle.com/coding/recipes/multi-debit-credit-transfers/)). SETUP→LIMIT establishes the withdrawal ceiling; four `BalancingDebit`+`BalancingCredit` transfers drain A→B→C→D in order without pre-reading balances; SETUP→X delivers the amount; LIMIT→SETUP (not linked) clears the ceiling. `--waterfall-batch 8` bundles 8 chains into one `CreateTransfers` call.
+
+**TB recipe — Optimistic:** single direct debit from A (1 transfer). `DebitsMustNotExceedCredits` on A makes TB self-enforce the balance check. On `exceeds_credits`, falls back to the full 7-transfer chain using all 4 accounts.
+
+**Scenario 2 — Hot account:** all 32 goroutines debit the same TB source account — intentional contention to test single-balance write throughput.
+
+**Scenario 3 — Fan-out:** one payer → 1 000 recipients in a single unlinked `CreateTransfers` batch per op.
+
+---
+
+## Throughput ceiling and hardware path
+
+The benchmark above runs on a single-node Docker container backed by a **GCP `pd-standard` persistent disk**. The observed ~7 000 Txns/s (waterfall) and ~100 k Txns/s (fan-out) ceilings are primarily an I/O artifact, not a TigerBeetle design limit.
+
+### Why `fsync` is the bottleneck
+
+TigerBeetle commits every batch to disk before acknowledging clients. On this VM:
+
+| Storage | `fsync` latency | Approx. TB throughput |
+|---|---|---|
+| `pd-standard` (this benchmark) | ~1–2 ms | ~50–100 k transfers/s |
+| `pd-ssd` | ~0.5 ms | ~200 k transfers/s |
+| Local NVMe SSD | ~50–100 µs | ~500 k–1 M transfers/s |
+| Bare-metal NVMe | ~20–50 µs | 1 M+ transfers/s (TB published figure) |
+
+Each doubling of `fsync` speed roughly doubles TB throughput because the event loop spends the majority of its wall time waiting for the storage acknowledgement.
+
+### Why local NVMe requires a cluster
+
+Local SSDs are ephemeral — data is lost if the VM stops. The production solution is a **3-node TigerBeetle cluster** using VSR (Viewstamped Replication) consensus. Each node has its own local NVMe; the cluster tolerates one node failure without data loss. Durability comes from replication, not disk redundancy.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  3-node TB cluster (VSR consensus, quorum = 2/3)    │
+│                                                     │
+│  node-1 [local NVMe]  ──┐                           │
+│  node-2 [local NVMe]  ──┼──► clients (any node)    │
+│  node-3 [local NVMe]  ──┘                           │
+└─────────────────────────────────────────────────────┘
+```
+
+**Latency trade-off:** the primary must wait for 2/3 nodes to `fsync` before committing (adds one cross-node RTT, ~0.5–1 ms intra-zone). Net result is still far faster than a single node on `pd-standard`.
+
+**Batching and the ceiling:** increasing `--waterfall-batch` beyond 8 gives diminishing returns on this VM (~+15% from 8→128) because the batch of 32 concurrent goroutines already saturates the ~50 k transfers/s storage ceiling. On NVMe the ceiling shifts to ~500 k transfers/s, making larger batches worthwhile again.
+
+---
+
+## Next steps
+
+Once throughput is confirmed, the full pipeline adds:
+- **RabbitMQ** — AMQP broker (CDC target for `tigerbeetle amqp`)
+- **Kafka + Kafka Connect** — bridges RabbitMQ → Kafka for durable high-throughput streaming
+- **ClickHouse** — consumes from Kafka, stores events for OLAP queries
+- **Backup sidecar** — periodic snapshots of the TigerBeetle data file
+
+---
+
+## Project setup
+
+### Prerequisites
 
 - Docker + Docker Compose
 - Go 1.22+
 
-## Quick start
-
-```bash
-# 1. Start TigerBeetle
-docker compose up --build -d
-
-# 2. Run all tests
-go run .
-```
-
-## Starting TigerBeetle
+### Starting TigerBeetle
 
 ```bash
 docker compose up --build -d
@@ -31,13 +205,11 @@ To stop and wipe data:
 docker compose down -v   # -v also removes the data volume
 ```
 
-## Running the tests
+### Running the correctness tests
 
 ```bash
 go run .
 ```
-
-### What each step tests
 
 | Step | Scenario | What is asserted |
 |------|----------|-----------------|
@@ -49,7 +221,7 @@ go run .
 | 6 | **Balance constraint** | Attempt overdraft on `DebitsMustNotExceedCredits` account; assert `TransferExceedsCredits` |
 | 7 | **Throughput** | Hammer concurrent batched transfers for `--duration`; report TPS vs 50k target |
 
-### Flags
+Flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -59,13 +231,7 @@ go run .
 | `--concurrency` | `32` | Parallel goroutines for throughput test |
 | `--batch` | `8189` | Transfers per batch (max 8189 in production mode) |
 
-Skip to throughput only, with a longer run:
-
-```bash
-go run . --duration 30s
-```
-
-## Expected output
+### Expected output
 
 ```
 Connected to TigerBeetle at 127.0.0.1:3000 (cluster 0)
@@ -114,182 +280,7 @@ Connected to TigerBeetle at 127.0.0.1:3000 (cluster 0)
   ✓ target of 50000 TPS met
 ```
 
-### Throughput notes
-
-**32 goroutines** is the sweet spot on this setup — beyond that, extra concurrency adds coordination overhead without increasing throughput.
-
 | Mode | Max batch | Observed TPS (GCP VM) |
 |------|-----------|----------------------|
 | `--development` | 253 | ~40k |
 | production (default) | 8189 | ~100k |
-
-On dedicated bare-metal hardware TigerBeetle sustains 1M+ TPS.
-
-## Benchmark: TigerBeetle + Cloud SQL (PostgreSQL)
-
-### Architecture
-
-```
-Application
-    │
-    ├─► Cloud SQL PostgreSQL  — account metadata (user → TB account IDs, priority)
-    │       user_accounts(user_id, account_id, priority)
-    │
-    └─► TigerBeetle           — financial ledger (all balances, every transfer)
-```
-
-Each benchmark operation runs in two variants back-to-back:
-
-| Variant | What it tests |
-|---|---|
-| **TB only** | Account IDs hardcoded at setup — pure TigerBeetle throughput, no metadata cost |
-| **PG → TB** | Account IDs fetched from Cloud SQL at runtime — realistic production path |
-
-The delta between the two variants is the **cost of the metadata round-trip**.
-
-### Infrastructure
-
-| Component | Detail |
-|---|---|
-| TigerBeetle | Single-node Docker container, same VM |
-| VM | GCP `e2-standard-4` (4 vCPU / 16 GB), `us-central1-a` |
-| Cloud SQL | `db-custom-2-8192` ENTERPRISE, Postgres 16, `us-central1`, private IP `10.46.1.3` |
-| Network (PG) | Same-region VPC private IP, ~0.3 ms base RTT |
-| Concurrency | 32 goroutines, 15 s per scenario |
-
----
-
-### Scenario 1 — Waterfall withdrawal
-
-**What it models:** A user has 4 accounts ranked by priority (e.g. checking → savings → credit → wallet). A withdrawal drains them in order atomically — if any leg fails, the whole draw rolls back.
-
-**Contention:** None. Each goroutine operates on its own independent set of 4 accounts. This isolates per-operation overhead with no lock or event-loop queuing.
-
-**TB operation:** `CreateTransfers` — **8 waterfall chains per TB call** (default `--waterfall-batch 8`). Each chain is a 7-transfer linked sequence implementing the TB [Balancing Debits recipe](https://docs.tigerbeetle.com/coding/recipes/multi-debit-credit-transfers/): SETUP→LIMIT establishes the withdrawal ceiling, four `BalancingDebit`+`BalancingCredit` source transfers drain accounts in priority order without pre-reading balances, SETUP→X delivers the collected amount, and LIMIT→SETUP (not linked) clears the ceiling. Batching 8 chains into one `CreateTransfers` call amortises the fixed per-call overhead (network round-trip + TB event-loop wakeup) across 8 transactions.
-
-**PG query (one round-trip for all 8 chains):**
-```sql
-SELECT user_id, account_id FROM user_accounts
-WHERE user_id = ANY($1)   -- 8 user IDs
-ORDER BY user_id, priority
-```
-
-| Variant | Calls | Txns/s | p50/call | p99/call | p999/call | Errors |
-|---|---|---|---|---|---|---|
-| **TB only** | 13 858 | 7 251 | 14.5 ms | 327.4 ms | 417.1 ms | 0 |
-| **PG → TB** | 13 176 | 7 000 | 14.5 ms | 363.4 ms | 668.7 ms | 0 |
-
-> p50/p99 are per TB call (= 8 chains). Per-transaction p50 ≈ **1.8 ms**.
-
-**PG metadata overhead: −3% Txns/s, 0 ms p50/call.** Batching the PG lookup into one `ANY($8)` query cuts metadata cost to ~0.25 ms per transaction — negligible vs the TB round-trip. The `ANY()` query also naturally staggers goroutine arrivals at TB, mirroring the contention-smoothing seen in Scenario 2.
-
-**Effect of batching (`--waterfall-batch`):**
-
-| Batch | Txns/s | per-txn p50 | p99/call |
-|---|---|---|---|
-| 1 (unbatched) | 2 788 | 7.1 ms | 85 ms |
-| **8 (default)** | **7 251** | **~1.8 ms** | 327 ms |
-| 16 | 8 019 | ~1.3 ms | 520 ms |
-
-Batch=8 gives a **+160% throughput gain** over unbatched. Batch=16 adds only another +10% while doubling p99 — diminishing returns because the TB event loop processes larger batches with proportionally longer latency.
-
----
-
-### Scenario 2 — Hot account withdrawal
-
-**What it models:** A shared pool, float account, or hot wallet that many concurrent users withdraw from simultaneously. The single source account is the contention point.
-
-**Contention:** All 32 goroutines debit the **same TB source account** in every iteration. This is intentional — it directly tests how each system handles write contention on a single balance. Each goroutine has its own destination account to isolate the credit side.
-
-**TB operation:** `CreateTransfers` — single transfer per op.
-
-**PG query:**
-```sql
-SELECT account_id FROM user_accounts
-WHERE user_id = $1
-ORDER BY priority LIMIT 1
-```
-
-| Variant | Ops | Txns/s | p50 | p99 | p999 | Errors |
-|---|---|---|---|---|---|---|
-| **TB only** | 60 519 | 4 031 | 4.4 ms | 87.6 ms | 487.8 ms | 0 |
-| **PG → TB** | 62 651 | 4 176 | 5.9 ms | 20.4 ms | 208.0 ms | 0 |
-
-**PG metadata overhead: effectively none (+4% Txns/s, +1.5 ms p50).** The notable result is that p99 is *better* with PG→TB (20 ms vs 88 ms). The PG query naturally staggers goroutine arrivals at TB — each goroutine spends ~1.5 ms in PG before hitting TB — which reduces simultaneous contention on the hot account and smooths out the p99 spike.
-
-TigerBeetle sustains ~4 000 ops/s under 32-goroutine contention on a single account with no errors. A PostgreSQL ledger under the same load would serialize all 32 goroutines behind a row lock, collapsing throughput.
-
----
-
-### Scenario 3 — Fan-out to 1 000 accounts
-
-**What it models:** One payer distributes funds to 1 000 recipients in a single operation — payroll, airdrop, batch settlement. Each worker has its own independent source and destination set.
-
-**Contention:** None between workers. Within a single operation, 1 000 destination accounts are credited — TB processes these as one batch in its event loop.
-
-**TB operation:** `CreateTransfers` — unlinked batch of 1 000 transfers (individual transfers are independent; atomicity is not required for fan-out).
-
-**PG queries:**
-```sql
--- Payer account
-SELECT account_id FROM user_accounts WHERE user_id = $1 LIMIT 1
-
--- All payee accounts in one round-trip
-SELECT account_id FROM user_accounts WHERE user_id = ANY($1)
-```
-
-| Variant | Ops | Txns/s | p50 | p99 | p999 | Errors |
-|---|---|---|---|---|---|---|
-| **TB only** | 1 633 | 106 872 | 213.5 ms | 676.2 ms | 712.3 ms | 0 |
-| **PG → TB** | 1 219 | 78 735 | 320.2 ms | 1 334.8 ms | 1 371.5 ms | 0 |
-
-**PG metadata overhead: −26% Txns/s, +107 ms p50.** The `ANY($1000)` query scanning 1 000 user IDs adds ~100 ms per operation — the largest relative cost of any scenario. p99 diverges strongly between variants (676 ms vs 1 335 ms): the PG lookup's ~100 ms cost, multiplied by a 32-goroutine concurrency, creates queuing that TB's batch commit hides in the TB-only case.
-
----
-
-### Results summary
-
-> **Txns/s** = complete business transactions per second (1 waterfall = 1 txn; 1 fan-out to 1 000 = 1 000 txns).
-
-| Scenario | Variant | Txns/s | p50/txn | p99/call |
-|---|---|---|---|---|
-| 1. Waterfall (batch=8) | TB only | 7 251 | ~1.8 ms | 327 ms |
-| 1. Waterfall (batch=8) | PG → TB | 7 000 | ~1.8 ms | 363 ms |
-| 2. Hot withdrawal | TB only | 4 031 | 4.4 ms | 88 ms |
-| 2. Hot withdrawal | PG → TB | 4 176 | 5.9 ms | 20 ms |
-| 3. Fan-out→1000 | TB only | 106 872 | 0.21 ms | 676 ms |
-| 3. Fan-out→1000 | PG → TB | 78 735 | 0.27 ms | 1 335 ms |
-
-**Cloud SQL metadata overhead per operation:**
-
-| Scenario | PG query | Latency added (p50/txn) | Throughput cost |
-|---|---|---|---|
-| Waterfall | `SELECT` 32 rows, `ANY($8)` | ~0 ms (amortised) | −3% |
-| Hot withdrawal | `SELECT` 1 row, index scan | +1.5 ms | 0% (staging effect) |
-| Fan-out | `SELECT` 1 000 rows, `ANY($1000)` | +107 ms | −26% |
-
-Single-row lookups cost ~2 ms; batching them into `ANY()` queries amortises this to near zero. The `ANY($1000)` fan-out is the expensive outlier — cache payee IDs in the application layer if that matters.
-
-### Re-running
-
-```bash
-go run ./bench \
-  --tb-address 127.0.0.1:3000 \
-  --pg-dsn "postgres://postgres:PASSWORD@10.46.1.3/ledger_bench" \
-  --duration 15s \
-  --concurrency 32 \
-  --fanout-dests 1000 \
-  --waterfall-batch 8
-```
-
-Cloud SQL instance: `ledger-bench-pg` (`us-central1`, private IP `10.46.1.3`).
-
----
-
-## Next steps
-
-Once throughput is confirmed, the full pipeline adds:
-- **RabbitMQ** — AMQP broker (CDC target for `tigerbeetle amqp`)
-- **Kafka + Kafka Connect** — bridges RabbitMQ → Kafka for durable high-throughput streaming
-- **ClickHouse** — consumes from Kafka, stores events for OLAP queries
-- **Backup sidecar** — periodic snapshots of the TigerBeetle data file

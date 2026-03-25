@@ -52,10 +52,10 @@ type Result struct {
 	ops       int64
 	tps       float64
 	xferTPS   float64
-	p50       time.Duration
-	p99       time.Duration
-	p999      time.Duration
-	errors    int64
+	p50    time.Duration
+	p99    time.Duration
+	pMax   time.Duration
+	errors int64
 }
 
 func main() {
@@ -106,6 +106,21 @@ func main() {
 				return err
 			}
 			return tbWF[id].doWithIDs(tbClient, chainIDs)
+		}),
+		// Optimistic: try highest-priority account first (1 TB transfer); fall back to
+		// full 7-transfer balancing chain only if that account is depleted.
+		run("1. Waterfall", "Optimistic", 1, *concurrency, *duration, func(id int) error {
+			return tbWF[id].doOptimistic(tbClient)
+		}),
+		// Opt PG→TB: fetch all 4 source IDs in one PG round-trip, then try the fast
+		// path with ids[0]. On miss the full chain uses the already-fetched IDs — no
+		// second PG round-trip.
+		run("1. Waterfall", "Opt PG→TB", 1, *concurrency, *duration, func(id int) error {
+			allIDs, err := pgWF[id].lookupFirstChain(ctx, pgPool)
+			if err != nil {
+				return err
+			}
+			return tbWF[id].doOptimisticWithIDs(tbClient, allIDs)
 		}),
 	)
 
@@ -206,9 +221,9 @@ func run(name, variant string, xfrsPerOp, nWorkers int, dur time.Duration, op fu
 		ops:       totalOps,
 		tps:       tps,
 		xferTPS:   tps * float64(xfrsPerOp),
-		p50:       pct(allLats, 50),
-		p99:       pct(allLats, 99),
-		p999:      pct(allLats, 99.9),
+		p50:    pct(allLats, 50),
+		p99:    pct(allLats, 99),
+		pMax:   pct(allLats, 100),
 		errors:    totalErrs,
 	}
 	fmt.Printf(" ops=%d tps=%.0f errors=%d\n", totalOps, tps, totalErrs)
@@ -222,12 +237,12 @@ func pct(lats []time.Duration, p float64) time.Duration {
 	cp := make([]time.Duration, len(lats))
 	copy(cp, lats)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	if p >= 100 {
+		return cp[len(cp)-1]
+	}
 	idx := int(math.Ceil(p/100.0*float64(len(cp)))) - 1
 	if idx < 0 {
 		idx = 0
-	}
-	if idx >= len(cp) {
-		idx = len(cp) - 1
 	}
 	return cp[idx]
 }
@@ -235,13 +250,19 @@ func pct(lats []time.Duration, p float64) time.Duration {
 func printResults(results []Result) {
 	fmt.Println()
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "Scenario\tVariant\tTxns/s\tp50\tp99\tp999\tErrors\t")
-	fmt.Fprintln(w, "--------\t-------\t------\t---\t---\t----\t------\t")
+	fmt.Fprintln(w, "Scenario\tVariant\tTxns/s\tp50\tp99\tmax\tErrors\t")
+	fmt.Fprintln(w, "--------\t-------\t------\t---\t---\t---\t------\t")
 	for _, r := range results {
+		// Latency is measured per-call. Divide by xfrsPerOp so the table shows
+		// per-transaction latency consistently across all scenarios.
+		scale := time.Duration(r.xfrsPerOp)
+		if scale < 1 {
+			scale = 1
+		}
 		fmt.Fprintf(w, "%s\t%s\t%.0f\t%s\t%s\t%s\t%d\t\n",
 			r.scenario, r.variant,
 			r.xferTPS,
-			fmtDur(r.p50), fmtDur(r.p99), fmtDur(r.p999),
+			fmtDur(r.p50/scale), fmtDur(r.p99/scale), fmtDur(r.pMax/scale),
 			r.errors,
 		)
 	}

@@ -5,7 +5,7 @@
 #   ./scripts/setup-alloydb.sh [--cpu-count <n>] [--project <proj>] [--region <r>] [--network <net>]
 #
 # Optional overrides (defaults match README):
-#   GCP_PROJECT       (default: sw-playground-ledger)
+#   LEDGER_GCP_PROJECT       (default: sw-playground-ledger)
 #   ALLOYDB_CLUSTER   (default: playground-ledger)
 #   ALLOYDB_REGION    (default: us-central1)
 #   ALLOYDB_INSTANCE  (default: primary)
@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-GCP_PROJECT="${GCP_PROJECT:-sw-playground-ledger}"
+LEDGER_GCP_PROJECT="${LEDGER_GCP_PROJECT:?LEDGER_GCP_PROJECT must be set (e.g. export LEDGER_GCP_PROJECT=sw-playground-ledger)}"
 ALLOYDB_CLUSTER="${ALLOYDB_CLUSTER:-playground-ledger}"
 ALLOYDB_REGION="${ALLOYDB_REGION:-us-central1}"
 ALLOYDB_INSTANCE="${ALLOYDB_INSTANCE:-primary}"
@@ -33,7 +33,7 @@ ALLOYDB_NETWORK="${ALLOYDB_NETWORK:-default}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cpu-count) ALLOYDB_CPU_COUNT="$2"; shift 2 ;;
-    --project)   GCP_PROJECT="$2";       shift 2 ;;
+    --project)   LEDGER_GCP_PROJECT="$2";       shift 2 ;;
     --region)    ALLOYDB_REGION="$2";    shift 2 ;;
     --network)   ALLOYDB_NETWORK="$2";   shift 2 ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
@@ -44,22 +44,22 @@ done
 # Helpers
 # ---------------------------------------------------------------------------
 log() { echo "[setup-alloydb] $*"; }
-gcloud_alloydb() { gcloud alloydb "$@" --project="$GCP_PROJECT"; }
+gcloud_alloydb() { gcloud alloydb "$@" --project="$LEDGER_GCP_PROJECT"; }
 
 upsert_secret() {
   local name="$1"
   local value="$2"
   local exists
   exists=$(gcloud secrets describe "$name" \
-    --project="$GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
+    --project="$LEDGER_GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
   if [[ -z "$exists" ]]; then
     log "Creating secret '$name'..."
     printf '%s' "$value" | gcloud secrets create "$name" \
-      --project="$GCP_PROJECT" --replication-policy=automatic --data-file=- --quiet
+      --project="$LEDGER_GCP_PROJECT" --replication-policy=automatic --data-file=- --quiet
   else
     log "Secret '$name' exists. Adding new version..."
     printf '%s' "$value" | gcloud secrets versions add "$name" \
-      --project="$GCP_PROJECT" --data-file=- --quiet
+      --project="$LEDGER_GCP_PROJECT" --data-file=- --quiet
   fi
 }
 
@@ -68,7 +68,7 @@ upsert_secret() {
 # ---------------------------------------------------------------------------
 log "Enabling required GCP APIs..."
 gcloud services enable alloydb.googleapis.com secretmanager.googleapis.com \
-  --project="$GCP_PROJECT" --quiet
+  --project="$LEDGER_GCP_PROJECT" --quiet
 
 # ---------------------------------------------------------------------------
 # 2. Generate or reuse postgres password
@@ -77,7 +77,7 @@ ALLOYDB_PASSWORD_SECRET="ALLOYDB_POSTGRES_PASSWORD"
 
 ALLOYDB_PASSWORD=$(gcloud secrets versions access latest \
   --secret="$ALLOYDB_PASSWORD_SECRET" \
-  --project="$GCP_PROJECT" 2>/dev/null || true)
+  --project="$LEDGER_GCP_PROJECT" 2>/dev/null || true)
 
 if [[ -z "$ALLOYDB_PASSWORD" ]]; then
   log "Generating a new random password..."
@@ -168,12 +168,12 @@ upsert_secret "ALLOYDB_DSN" "$ALLOYDB_DSN"
 # ---------------------------------------------------------------------------
 for SECRET in CRDB_DSN; do
   EXISTS=$(gcloud secrets describe "$SECRET" \
-    --project="$GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
+    --project="$LEDGER_GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
   if [[ -z "$EXISTS" ]]; then
     log "Creating placeholder secret '$SECRET' (update with real value later)..."
     printf '%s' "PLACEHOLDER" | gcloud secrets create "$SECRET" \
-      --project="$GCP_PROJECT" --replication-policy=automatic --data-file=- --quiet
-    log "  -> gcloud secrets versions add $SECRET --data-file=- --project=$GCP_PROJECT"
+      --project="$LEDGER_GCP_PROJECT" --replication-policy=automatic --data-file=- --quiet
+    log "  -> gcloud secrets versions add $SECRET --data-file=- --project=$LEDGER_GCP_PROJECT"
   else
     log "Secret '$SECRET' already exists. Skipping."
   fi
@@ -197,7 +197,7 @@ log "AlloyDB setup complete."
 log "  Cluster:    $ALLOYDB_CLUSTER ($ALLOYDB_REGION)"
 log "  Instance:   $ALLOYDB_INSTANCE"
 log "  Private IP: $PRIVATE_IP"
-log "  Secrets saved to project $GCP_PROJECT:"
+log "  Secrets saved to project $LEDGER_GCP_PROJECT:"
 log "    ALLOYDB_POSTGRES_PASSWORD  (generated password)"
 log "    ALLOYDB_DSN                (connection string)"
 log ""

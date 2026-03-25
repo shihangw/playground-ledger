@@ -1,5 +1,6 @@
-# Go binary (built by `go build .`)
+# Go binaries
 tigerbeetle-setup
+bench/bench
 
 # Test/benchmark output
 *.out

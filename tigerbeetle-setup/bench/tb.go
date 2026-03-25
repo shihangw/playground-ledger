@@ -48,13 +48,18 @@ const tbGlobalBank = uint64(50_000_000)
 // across A+B+C+D < T, rolling back the entire chain atomically.
 
 const (
+	// 1 unit = $0.10. Priority accounts hold $5 (50 units) each;
+	// cash holds $100 000 (1 000 000 units). Each priority account serves
+	// exactly 50 draws before depleting; top-up fires every 150 draws so the
+	// bench cycles A→B→C→D within each top-up period.
 	tbWaterfallTarget    = uint64(1)
 	tbWaterfallAmountMax = uint64(1_000_000_000_000) // >> any realistic LIMIT balance
 )
 
 // waterfallChain holds the 7 account IDs for one independent waterfall chain.
+// Priority order: [0] daily credit → [1] monthly credit → [2] bonus credit → [3] cash
 type waterfallChain struct {
-	sources [4]types.Uint128 // A,B,C,D — debits_must_not_exceed_credits
+	sources [4]types.Uint128 // debits_must_not_exceed_credits
 	dest    types.Uint128    // X — receives funds
 	setup   types.Uint128    // SETUP control — no constraint
 	limit   types.Uint128    // LIMIT control — debits_must_not_exceed_credits
@@ -63,8 +68,16 @@ type waterfallChain struct {
 // tbWaterfallWorker owns nChains independent account sets.
 // Each doHardcoded / doWithIDs call submits all chains as one CreateTransfers batch,
 // amortising the fixed per-call overhead across nChains transactions.
+//
+// Source balances: A=B=C=50 units ($5.00), D=1_000_000 ($100 000).
+// Each priority account serves exactly 50 draws ($5.00) before depleting.
+// maybeTopUp adds +50 to A, B, C every 150 draws, so one full top-up cycle
+// covers A (draws 1–50) → B (51–100) → C (101–150) → D (remainder).
+const tbTopUpEvery = 150
+
 type tbWaterfallWorker struct {
-	chains []waterfallChain
+	chains   []waterfallChain
+	drawsCnt int
 }
 
 func tbSetupWaterfall(client tigerbeetle_go.Client, nWorkers, nChains int) []tbWaterfallWorker {
@@ -95,7 +108,9 @@ func tbSetupWaterfall(client tigerbeetle_go.Client, nWorkers, nChains int) []tbW
 		accounts = accounts[n:]
 	}
 
-	// Fund all sources.
+	// 1 unit = $0.10. Priority accounts: 50 units ($5.00) each; depletes after 50 draws.
+	// Cash: 1_000_000 units ($100 000.00) — safety net, never depletes in a cycle.
+	sourceFunds := [4]uint64{50, 50, 50, 1_000_000}
 	transfers := make([]types.Transfer, 0, nWorkers*nChains*4)
 	for i := 0; i < nWorkers; i++ {
 		for c := 0; c < nChains; c++ {
@@ -104,7 +119,7 @@ func tbSetupWaterfall(client tigerbeetle_go.Client, nWorkers, nChains int) []tbW
 				transfers = append(transfers, types.Transfer{
 					ID: types.ID(), DebitAccountID: types.ToUint128(tbGlobalBank),
 					CreditAccountID: types.ToUint128(b + j),
-					Amount: types.ToUint128(1_000_000_000), Ledger: 1, Code: 1,
+					Amount: types.ToUint128(sourceFunds[j]), Ledger: 1, Code: 1,
 				})
 			}
 		}
@@ -134,19 +149,65 @@ func tbSetupWaterfall(client tigerbeetle_go.Client, nWorkers, nChains int) []tbW
 	return workers
 }
 
+// maybeTopUp re-funds sources A, B, C (+5 each) for every chain whenever
+// drawsCnt reaches tbTopUpEvery. D is left alone — its 10_000 initial balance
+// absorbs any remaining draws within the cycle.
+func (w *tbWaterfallWorker) maybeTopUp(client tigerbeetle_go.Client) error {
+	if w.drawsCnt < tbTopUpEvery {
+		return nil
+	}
+	w.drawsCnt = 0
+	tops := make([]types.Transfer, 0, len(w.chains)*3)
+	for c := range w.chains {
+		ch := &w.chains[c]
+		for j := 0; j < 3; j++ {
+			tops = append(tops, types.Transfer{
+				ID: types.ID(), DebitAccountID: types.ToUint128(tbGlobalBank),
+				CreditAccountID: ch.sources[j],
+				Amount: types.ToUint128(50), Ledger: 1, Code: 1, // +$5.00 per cycle
+			})
+		}
+	}
+	for len(tops) > 0 {
+		n := 8189
+		if n > len(tops) {
+			n = len(tops)
+		}
+		res, err := client.CreateTransfers(tops[:n])
+		if err != nil {
+			return err
+		}
+		if len(res) > 0 {
+			return fmt.Errorf("topUp transfer[%d]: %v", res[0].Index, res[0].Result)
+		}
+		tops = tops[n:]
+	}
+	return nil
+}
+
 // doHardcoded skips PG — submits all chains in one CreateTransfers call.
 func (w *tbWaterfallWorker) doHardcoded(client tigerbeetle_go.Client) error {
+	if err := w.maybeTopUp(client); err != nil {
+		return err
+	}
 	batch := make([]types.Transfer, 0, len(w.chains)*7)
 	for c := range w.chains {
 		ch := &w.chains[c]
 		batch = appendChain(batch, ch.sources[0], ch.sources[1], ch.sources[2], ch.sources[3], ch.dest, ch.setup, ch.limit)
 	}
-	return tbSubmit(client, batch)
+	if err := tbSubmit(client, batch); err != nil {
+		return err
+	}
+	w.drawsCnt += len(w.chains)
+	return nil
 }
 
 // doWithIDs submits all chains using source IDs resolved by PG.
 // chainIDs[c] is the slice of 4 source account IDs for chain c, ordered by priority.
 func (w *tbWaterfallWorker) doWithIDs(client tigerbeetle_go.Client, chainIDs [][]int64) error {
+	if err := w.maybeTopUp(client); err != nil {
+		return err
+	}
 	batch := make([]types.Transfer, 0, len(w.chains)*7)
 	for c, ids := range chainIDs {
 		if len(ids) < 4 {
@@ -157,7 +218,11 @@ func (w *tbWaterfallWorker) doWithIDs(client tigerbeetle_go.Client, chainIDs [][
 			types.ToUint128(uint64(ids[2])), types.ToUint128(uint64(ids[3]))
 		batch = appendChain(batch, a, b, cc, d, ch.dest, ch.setup, ch.limit)
 	}
-	return tbSubmit(client, batch)
+	if err := tbSubmit(client, batch); err != nil {
+		return err
+	}
+	w.drawsCnt += len(chainIDs)
+	return nil
 }
 
 // appendChain appends the 7-transfer balancing-debit chain for one waterfall to batch.
@@ -177,6 +242,67 @@ func appendChain(batch []types.Transfer, a, b, c, d, dest, setup, limit types.Ui
 			Amount: types.ToUint128(tbWaterfallAmountMax), Ledger: 1, Code: 1,
 			Flags: types.TransferFlags{BalancingCredit: true}.ToUint16()},
 	)
+}
+
+// doOptimistic tries a single debit from the highest-priority source (chains[0].sources[0]).
+// Because that account has DebitsMustNotExceedCredits, TB returns exceeds_credits if it
+// lacks funds — no balance pre-read needed. On success the op completes in 1 transfer and
+// 1 TB round-trip. On miss it falls back to the full 7-transfer balancing chain.
+// In production the fast path runs ~99% of the time (account is refunded daily).
+func (w *tbWaterfallWorker) doOptimistic(client tigerbeetle_go.Client) error {
+	if err := w.maybeTopUp(client); err != nil {
+		return err
+	}
+	ch := &w.chains[0]
+	res, err := client.CreateTransfers([]types.Transfer{{
+		ID:              types.ID(),
+		DebitAccountID:  ch.sources[0],
+		CreditAccountID: ch.dest,
+		Amount:          types.ToUint128(tbWaterfallTarget),
+		Ledger:          1, Code: 1,
+	}})
+	if err != nil {
+		return err
+	}
+	w.drawsCnt++
+	if len(res) == 0 {
+		return nil // fast path — A had funds
+	}
+	// Fallback: drain remaining accounts via full balancing chain.
+	return tbSubmit(client, appendChain(nil,
+		ch.sources[0], ch.sources[1], ch.sources[2], ch.sources[3],
+		ch.dest, ch.setup, ch.limit))
+}
+
+// doOptimisticWithIDs tries allIDs[0]→dest first; on miss runs the full chain using
+// all 4 IDs. allIDs must already be fetched from PG in one round-trip by the caller.
+func (w *tbWaterfallWorker) doOptimisticWithIDs(client tigerbeetle_go.Client, allIDs []int64) error {
+	if len(allIDs) < 4 {
+		return fmt.Errorf("optimistic: need 4 source IDs, got %d", len(allIDs))
+	}
+	if err := w.maybeTopUp(client); err != nil {
+		return err
+	}
+	ch := &w.chains[0]
+	res, err := client.CreateTransfers([]types.Transfer{{
+		ID:              types.ID(),
+		DebitAccountID:  types.ToUint128(uint64(allIDs[0])),
+		CreditAccountID: ch.dest,
+		Amount:          types.ToUint128(tbWaterfallTarget),
+		Ledger:          1, Code: 1,
+	}})
+	if err != nil {
+		return err
+	}
+	w.drawsCnt++
+	if len(res) == 0 {
+		return nil // fast path — primary account had funds
+	}
+	a := types.ToUint128(uint64(allIDs[0]))
+	b := types.ToUint128(uint64(allIDs[1]))
+	c := types.ToUint128(uint64(allIDs[2]))
+	d := types.ToUint128(uint64(allIDs[3]))
+	return tbSubmit(client, appendChain(nil, a, b, c, d, ch.dest, ch.setup, ch.limit))
 }
 
 // ── Scenario 2: Hot account withdrawal ───────────────────────────────────────
