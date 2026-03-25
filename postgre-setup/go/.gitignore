@@ -1,0 +1,7 @@
+# Compiled binaries (built by go build ./cmd/...)
+bench
+stress
+ledger-stress
+api
+migrate
+dbstatus
