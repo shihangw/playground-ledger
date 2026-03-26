@@ -77,7 +77,7 @@ func main() {
 		poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	}
 	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, "SET lock_timeout = '200ms'; SET synchronous_commit = off")
+		_, err := conn.Exec(ctx, "SET lock_timeout = '200ms'")
 		return err
 	}
 

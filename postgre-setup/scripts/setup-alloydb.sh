@@ -6,7 +6,7 @@
 #
 # Optional overrides (defaults match README):
 #   LEDGER_GCP_PROJECT       (default: sw-playground-ledger)
-#   ALLOYDB_CLUSTER   (default: playground-ledger)
+#   ALLOYDB_CLUSTER   (default: ledger-bench)
 #   ALLOYDB_REGION    (default: us-central1)
 #   ALLOYDB_INSTANCE  (default: primary)
 #   ALLOYDB_CPU_COUNT (default: 2)
@@ -21,7 +21,7 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 LEDGER_GCP_PROJECT="${LEDGER_GCP_PROJECT:?LEDGER_GCP_PROJECT must be set (e.g. export LEDGER_GCP_PROJECT=sw-playground-ledger)}"
-ALLOYDB_CLUSTER="${ALLOYDB_CLUSTER:-playground-ledger}"
+ALLOYDB_CLUSTER="${ALLOYDB_CLUSTER:-ledger-bench}"
 ALLOYDB_REGION="${ALLOYDB_REGION:-us-central1}"
 ALLOYDB_INSTANCE="${ALLOYDB_INSTANCE:-primary}"
 ALLOYDB_CPU_COUNT="${ALLOYDB_CPU_COUNT:-2}"
@@ -102,7 +102,7 @@ if [[ -z "$CLUSTER_EXISTS" ]]; then
   gcloud_alloydb clusters create "$ALLOYDB_CLUSTER" \
     --region="$ALLOYDB_REGION" \
     --network="$ALLOYDB_NETWORK" \
-    --database-version=POSTGRES_15 \
+    --database-version=POSTGRES_18 \
     --password="$ALLOYDB_PASSWORD" \
     --quiet
   log "Cluster created."

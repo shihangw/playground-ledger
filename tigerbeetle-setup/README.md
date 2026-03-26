@@ -14,10 +14,10 @@ Benchmarks and correctness tests for TigerBeetle, with PostgreSQL as a metadata 
 | 1. Waterfall (batch=8) | PG → TB | 13 731 | 422 µs | 24.9 ms | 100.0 ms |
 | 1. Waterfall | Optimistic | 11 347 | 660 µs | 53.5 ms | 340.9 ms |
 | 1. Waterfall | Opt PG→TB | 5 032 | 2.3 ms | 95.9 ms | 603.0 ms |
-| 2. Hot withdrawal | TB only | 16 174 | 637 µs | 23.2 ms | 417.9 ms |
-| 2. Hot withdrawal | PG → TB | 12 150 | 1.2 ms | 35.9 ms | 372.6 ms |
-| 3. Fan-out→1000 | TB only | 206 234 | 136 µs | 698 µs | 719 µs |
-| 3. Fan-out→1000 | PG → TB | 161 926 | 183 µs | 670 µs | 718 µs |
+| 2. Single Account Debit | TB only | 16 174 | 637 µs | 23.2 ms | 417.9 ms |
+| 2. Single Account Debit | PG → TB | 12 150 | 1.2 ms | 35.9 ms | 372.6 ms |
+| 3. Fan-out (1→1000) | TB only | 206 234 | 136 µs | 698 µs | 719 µs |
+| 3. Fan-out (1→1000) | PG → TB | 161 926 | 183 µs | 670 µs | 718 µs |
 
 **Local Postgres container overhead:**
 
@@ -25,7 +25,7 @@ Benchmarks and correctness tests for TigerBeetle, with PostgreSQL as a metadata 
 |---|---|---|---|
 | Waterfall (batch=8) | `SELECT` 32 rows, `ANY($8)` | +40 µs | −32% |
 | Waterfall (Optimistic) | `SELECT` 4 rows, `ORDER BY priority` | +1.6 ms | −56% |
-| Hot withdrawal | `SELECT` 1 row, index scan | +0.6 ms | −25% |
+| Single Account Debit | `SELECT` 1 row, index scan | +0.6 ms | −25% |
 | Fan-out | `SELECT` 1 000 rows, `ANY($1000)` | +47 µs/txn | −21% |
 
 On NVMe the TB event loop is substantially faster than on `pd-standard`, so even local Postgres container latency (~0.1 ms RTT) becomes a larger fraction of total op time — the overhead percentage is higher than the Cloud SQL numbers despite lower absolute RTT.
@@ -52,7 +52,7 @@ On NVMe the TB event loop is substantially faster than on `pd-standard`, so even
 
 ---
 
-### Scenario 2 — Hot account withdrawal
+### Scenario 2 — Single Account Debit
 
 | Variant | Txns/s | p50 | p99 | max |
 |---|---|---|---|---|
@@ -63,7 +63,7 @@ TigerBeetle sustains ~16 000 ops/s under 32-goroutine contention on a single acc
 
 ---
 
-### Scenario 3 — Fan-out to 1 000 accounts
+### Scenario 3 — Fan-out (1 Source → 1 000 Recipients)
 
 | Variant | Txns/s | p50/txn | p99/txn | max/txn |
 |---|---|---|---|---|
@@ -131,9 +131,9 @@ Each priority account serves exactly 50 draws before depleting. Top-up fires eve
 
 **TB recipe — Optimistic:** single direct debit from A (1 transfer). `DebitsMustNotExceedCredits` on A makes TB self-enforce the balance check. On `exceeds_credits`, falls back to the full 7-transfer chain using all 4 accounts.
 
-**Scenario 2 — Hot account:** all 32 goroutines debit the same TB source account — intentional contention to test single-balance write throughput.
+**Scenario 2 — Single Account Debit:** all 32 goroutines debit the same TB source account — intentional contention to test single-balance write throughput.
 
-**Scenario 3 — Fan-out:** one payer → 1 000 recipients in a single unlinked `CreateTransfers` batch per op.
+**Scenario 3 — Fan-out (1 Source → 1 000 Recipients):** one payer → 1 000 recipients in a single unlinked `CreateTransfers` batch per op.
 
 ---
 
