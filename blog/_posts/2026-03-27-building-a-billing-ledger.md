@@ -112,8 +112,91 @@ We designed scenarios that map directly to our production workload:
 
 ## The Results: Head-to-Head
 
+<canvas id="waterfallChart" width="800" height="400"></canvas>
+<script>
+new Chart(document.getElementById('waterfallChart'), {
+  type: 'bar',
+  data: {
+    labels: ['Waterfall', 'Waterfall\n(Optimistic)', 'Single Account\nDebit', 'Fan-out\n(transfers/s)'],
+    datasets: [
+      {
+        label: 'TigerBeetle (NVMe)',
+        data: [20064, 20064, 16174, 206234],
+        backgroundColor: 'rgba(255, 159, 64, 0.7)',
+        borderColor: 'rgba(255, 159, 64, 1)',
+        borderWidth: 1
+      },
+      {
+        label: 'AlloyDB (sync=off)',
+        data: [11434, 39690, 6484, 78867],
+        backgroundColor: 'rgba(54, 162, 235, 0.7)',
+        borderColor: 'rgba(54, 162, 235, 1)',
+        borderWidth: 1
+      },
+      {
+        label: 'AlloyDB (sync=on)',
+        data: [8986, 8542, 945, 37867],
+        backgroundColor: 'rgba(54, 162, 235, 0.3)',
+        borderColor: 'rgba(54, 162, 235, 1)',
+        borderWidth: 1,
+        borderDash: [5, 5]
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      title: { display: true, text: 'Throughput Comparison (TPS)', font: { size: 16 } },
+      legend: { position: 'bottom' }
+    },
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: { display: true, text: 'Transactions per Second' }
+      }
+    }
+  }
+});
+</script>
 
-
+<canvas id="latencyChart" width="800" height="400"></canvas>
+<script>
+new Chart(document.getElementById('latencyChart'), {
+  type: 'bar',
+  data: {
+    labels: ['Waterfall', 'Waterfall\n(Optimistic)', 'Single Account\nDebit', 'Fan-out\n(per batch)'],
+    datasets: [
+      {
+        label: 'TigerBeetle p99',
+        data: [20.2, 53.5, 23.2, 0.698],
+        backgroundColor: 'rgba(255, 159, 64, 0.7)',
+        borderColor: 'rgba(255, 159, 64, 1)',
+        borderWidth: 1
+      },
+      {
+        label: 'AlloyDB p99',
+        data: [13.0, 4.8, 21.2, 499],
+        backgroundColor: 'rgba(54, 162, 235, 0.7)',
+        borderColor: 'rgba(54, 162, 235, 1)',
+        borderWidth: 1
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      title: { display: true, text: 'p99 Latency (ms)', font: { size: 16 } },
+      legend: { position: 'bottom' }
+    },
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: { display: true, text: 'Milliseconds' }
+      }
+    }
+  }
+});
+</script>
 
 
 ### Key Takeaways
