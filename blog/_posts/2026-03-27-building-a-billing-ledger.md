@@ -1,11 +1,11 @@
 ---
-
-## layout: post
+layout: post
 title: "Building a Large-Scale Billing Ledger: Why, What, and How We Evaluated"
 date: 2026-03-27
 categories: [architecture, billing]
+---
 
-
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 We're building an in-house billing ledger to power the next phase of our growth. This article explains why we're doing it, what the system needs to support, and how we prototyped and benchmarked two very different database architectures on GCP to find the right recipe.
 
@@ -137,18 +137,15 @@ We designed scenarios that map directly to our production workload:
 We researched what the industry looks like. The pattern is clear: **everyone builds custom ledger logic on top of battle-tested databases.**
 
 
-| Company     | Ledger DB               | Key Detail                                              |
+| Company     | Finance DB              | Key Detail                                              |
 | ----------- | ----------------------- | ------------------------------------------------------- |
-| **Stripe**  | DocDB (MongoDB-like)    | Immutable event log, state machine, [5B events/day](https://stripe.dev/blog/ledger-stripe-system-for-tracking-and-validating-money-movement) |
-| **Uber**    | LedgerStore on Docstore | [Migrated from DynamoDB, saved $6M/year](https://www.uber.com/blog/dynamodb-to-docstore-migration/) |
-| **Netflix** | MySQL                   | [Master-master replication](https://netflixtechblog.com/netflix-billing-migration-to-aws-451fba085a4), CockroachDB for multi-region |
-| **Amazon**  | Aurora PostgreSQL       | [QLDB deprecated 2024](https://www.infoq.com/news/2024/07/aws-kill-qldb/), AWS recommends Aurora PG |
-| **OpenAI**  | PostgreSQL              | [Single unsharded primary + ~50 read replicas](https://openai.com/index/scaling-postgresql/) |
-| **PayPal**  | AlloyDB (migrating)     | [Moving from Oracle; 3x query perf, -50% TCO](https://www.webpronews.com/paypal-bets-its-ai-future-on-a-massive-google-cloud-database-migration-and-the-payoff-is-already-showing/) |
-| **Google**  | Spanner                 | [TrueTime, used for Google Ads (F1)](https://en.wikipedia.org/wiki/Spanner_(database)) |
+| **Stripe**  | Undisclosed             | Ledger processes [5B events/day](https://stripe.dev/blog/ledger-stripe-system-for-tracking-and-validating-money-movement) as immutable log; underlying DB not disclosed |
+| **Uber**    | LedgerStore on Docstore | Powers payment platform; [migrated from DynamoDB, saved $6M/year](https://www.uber.com/blog/dynamodb-to-docstore-migration/) |
+| **Netflix** | MySQL                   | [Billing transactions, subscriptions, taxes, and revenue](https://blog.bytebytego.com/p/ep60-netflix-tech-stack-databases) |
+| **OpenAI**  | Undisclosed (likely PG) | Atomic DB txns for [credit balance + usage billing](https://openai.com/index/beyond-rate-limits/); serialized per account |
+| **Amazon**  | QLDB (deprecated)       | [QLDB shut down 2025](https://www.infoq.com/news/2024/07/aws-kill-qldb/); AWS recommends Aurora PG as replacement |
 
-
-PostgreSQL is the most common choice for new systems. The trend is away from Oracle toward PostgreSQL-compatible managed services.
+Most companies treat their ledger database as proprietary and don't disclose it. Uber and Netflix are the most transparent — their engineering blogs detail the full architecture. Stripe publishes the ledger design but not the underlying database.
 
 ---
 
@@ -190,5 +187,7 @@ The next two articles in this series go deep on each database:
 
 - **[Deep Dive: TigerBeetle]({% post_url 2026-03-27-deep-dive-tigerbeetle %})** — linked transfer chains, batching strategies, the fsync ceiling, and how to build a waterfall on a purpose-built financial database.
 - **[Deep Dive: PostgreSQL on AlloyDB]({% post_url 2026-03-27-deep-dive-postgresql-alloydb %})** — optimistic CTEs, pipeline protocol batching, grant waterfall with lock ordering, and why `synchronous_commit=off` is safer than you think on AlloyDB.
+
+All benchmark code, schemas, and Docker setups are open source: **[github.com/shihangw/playground-ledger](https://github.com/shihangw/playground-ledger)**
 
 We built prototypes. We benchmarked them. The numbers de-risked the project and told us what's possible. The rest of this series shows exactly how each database works under the hood.
