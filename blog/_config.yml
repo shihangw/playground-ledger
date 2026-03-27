@@ -1,0 +1,23 @@
+title: "Billing Ledger Engineering"
+description: "Technical reports on building a large-scale billing ledger system"
+baseurl: "/playground-ledger"
+url: ""
+
+theme: minima
+
+markdown: kramdown
+kramdown:
+  input: GFM
+
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+
+defaults:
+  - scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
+
+header_pages: []
