@@ -22,5 +22,3 @@ defaults:
 
 header_pages: []
 
-exclude:
-  - internal/
