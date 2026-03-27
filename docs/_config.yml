@@ -21,3 +21,6 @@ defaults:
       layout: "post"
 
 header_pages: []
+
+exclude:
+  - internal/
