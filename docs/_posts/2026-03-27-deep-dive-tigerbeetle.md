@@ -6,6 +6,8 @@ categories: [database, tigerbeetle, benchmarks]
 ---
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
 
 TigerBeetle is a database built from scratch for one thing: financial transactions. No SQL. No query planner. No general-purpose flexibility. Just double-entry bookkeeping at the speed of `fsync`. This article covers how we benchmarked it, the key implementation tactics that make it fast, what it's genuinely good at, and where it falls short.
 
@@ -19,12 +21,23 @@ We set up TigerBeetle on a GCP `e2-standard-4` (4 vCPU, 16 GB RAM) with a 375 GB
 
 The architecture looks like this:
 
-```
-Go benchmark client (32 goroutines)
-  ├─→ PostgreSQL (metadata: user_id → account_id mappings)
-  └─→ TigerBeetle (financial transactions)
-        └─→ CDC sidecar → LavinMQ → ClickHouse (OLAP analytics)
-```
+<div class="mermaid">
+graph LR
+    A[Go Service<br/>32 goroutines] -->|user lookup| B[(PostgreSQL<br/>metadata)]
+    A -->|write txns| C[(TigerBeetle<br/>ledger)]
+    C -->|poll event log| D[CDC Sidecar<br/>tb amqp]
+    D -->|publish| E[LavinMQ<br/>AMQP broker]
+    E -->|fanout| F[(ClickHouse<br/>MergeTree)]
+    F --> G[OLAP Views<br/>daily vol / balances]
+
+    style C fill:#ffd8a8,stroke:#f59e0b
+    style B fill:#a5d8ff,stroke:#4a9eed
+    style F fill:#c3fae8,stroke:#22c55e
+    style D fill:#d0bfff,stroke:#8b5cf6
+    style E fill:#d0bfff,stroke:#8b5cf6
+    style A fill:#a5d8ff,stroke:#4a9eed
+    style G fill:#c3fae8,stroke:#22c55e
+</div>
 
 ---
 
@@ -244,6 +257,60 @@ Every transfer is fsync'd before acknowledgment. Every account balance is checke
 There's no SQL. You can't `SELECT * FROM transfers WHERE amount > 100 AND created_at > '2026-03-01'`. If you need analytics, reporting, or any query that isn't "look up account" or "create transfer," you need a separate system.
 
 Our solution: a CDC pipeline (TigerBeetle → LavinMQ → ClickHouse) that streams transfer events to an OLAP store. This adds operational complexity — now you're running three databases instead of one.
+
+#### How the CDC Pipeline Works
+
+<div class="mermaid">
+sequenceDiagram
+    participant TB as TigerBeetle
+    participant CDC as CDC Sidecar
+    participant MQ as LavinMQ (AMQP)
+    participant CH as ClickHouse
+
+    loop Every 1s or 2730 events
+        CDC->>TB: Poll event log (tb amqp)
+        TB-->>CDC: Batch of transfer events
+        CDC->>MQ: Publish to fanout exchange
+    end
+
+    MQ->>CH: RabbitMQ engine consumes
+    CH->>CH: Materialized view inserts<br/>into transfers (MergeTree)
+
+    Note over CH: Monthly partitions<br/>ORDER BY (ledger, event_time, transfer_id)<br/>TTL: 7 years
+</div>
+
+Each CDC event carries the full transfer context — not just the transfer itself, but the **account balance snapshots at event time** for both the debit and credit accounts. This means ClickHouse can reconstruct any account's balance at any point in history without replaying the log.
+
+```json
+{
+  "type": "single_phase",
+  "transfer": { "id": "...", "amount": 500, "code": 1 },
+  "debit_account": {
+    "id": 9000010,
+    "debits_posted": 500,
+    "credits_posted": 0
+  },
+  "credit_account": {
+    "id": 9000011,
+    "debits_posted": 0,
+    "credits_posted": 500
+  }
+}
+```
+
+The key design principle: **the CDC pipeline is async and non-blocking**. The write path (TigerBeetle) never waits for ClickHouse. If ClickHouse is down, LavinMQ buffers events. If the CDC sidecar is slow, TigerBeetle keeps writing. Analytics can lag minutes behind without affecting billing accuracy.
+
+#### Cost Concerns
+
+| Component | Cost Driver | Estimate at 500 TPS |
+|---|---|---|
+| **TigerBeetle** | NVMe storage only (open source) | ~$75/mo (375 GB local NVMe on GCP) |
+| **CDC Sidecar** | CPU only (runs alongside TB) | ~$0 marginal (shares the instance) |
+| **LavinMQ** | Transient — messages consumed in seconds | ~$0 marginal (minimal memory) |
+| **ClickHouse** | **Biggest cost driver** — stores full event history | ~$50-150/mo (1.3B rows/mo, ~40 GB compressed) |
+| **Cold storage (GCS)** | Detached old partitions | ~$0.02/GB/mo |
+
+At 500 TPS, the full CDC stack adds roughly **$100-200/mo** on top of TigerBeetle itself. The cost scales linearly with TPS — at 5,000 TPS, expect ~$500-1,000/mo for ClickHouse storage. The critical cost control is **partition detachment**: monthly partitions older than your active query window detach to GCS at $0.02/GB/mo instead of $0.12/GB/mo on ClickHouse.
 
 ### Metadata Lives Elsewhere
 
