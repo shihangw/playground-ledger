@@ -358,6 +358,35 @@ The specific guarantees at each stage:
 
 At 500 TPS, the full CDC stack adds roughly **$100-200/mo** on top of TigerBeetle itself. The cost scales linearly with TPS — at 5,000 TPS, expect ~$500-1,000/mo for ClickHouse storage. The critical cost control is **partition detachment**: monthly partitions older than your active query window detach to GCS at $0.02/GB/mo instead of $0.12/GB/mo on ClickHouse.
 
+#### Cold Partitions Are Still Queryable
+
+Detaching to GCS doesn't mean losing query access. ClickHouse can query GCS data directly via its `s3()` table function (GCS exposes an S3-compatible API):
+
+```sql
+-- Query a detached monthly partition directly from GCS
+SELECT
+    toDate(event_time) AS day,
+    count() AS transfers,
+    sum(amount) AS volume
+FROM s3(
+    'https://storage.googleapis.com/billing-archive/transfers/2026-01/*.parquet',
+    'Parquet'
+)
+WHERE ledger = 1
+GROUP BY day
+ORDER BY day
+```
+
+This gives you the best of both worlds: hot partitions (last 3–6 months) live in MergeTree for sub-second queries, while cold partitions sit in GCS at ~6x lower cost but remain queryable in seconds. For one-off audits or compliance queries that reach back years, the cold scan latency (seconds, not milliseconds) is perfectly acceptable.
+
+If you need cold data back at full speed temporarily (e.g., end-of-year audit), you can re-attach the partition:
+
+```sql
+ALTER TABLE transfers ATTACH PARTITION '202601'
+```
+
+This is a metadata operation — ClickHouse reads the data back from GCS into local MergeTree storage.
+
 ### Metadata Lives Elsewhere
 
 TigerBeetle stores accounts and transfers. It doesn't store users, products, pricing models, or any domain metadata. In our benchmark, every operation that needs user → account mappings requires a PostgreSQL lookup first.
