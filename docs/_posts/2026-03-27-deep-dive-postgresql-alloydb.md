@@ -2,7 +2,6 @@
 layout: post
 title: "Deep Dive: PostgreSQL on AlloyDB — 39,690 TPS with the Right Patterns"
 date: 2026-03-27
-categories: [database, postgresql, benchmarks]
 ---
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>

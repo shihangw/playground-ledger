@@ -22,3 +22,5 @@ defaults:
 
 header_pages: []
 
+permalink: /:year/:month/:day/:title/
+

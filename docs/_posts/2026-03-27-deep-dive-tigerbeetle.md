@@ -2,7 +2,6 @@
 layout: post
 title: "Deep Dive: TigerBeetle — A Purpose-Built Financial Transactions Database"
 date: 2026-03-27
-categories: [database, tigerbeetle, benchmarks]
 ---
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>

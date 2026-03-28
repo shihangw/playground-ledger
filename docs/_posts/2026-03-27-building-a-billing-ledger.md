@@ -2,7 +2,6 @@
 layout: post
 title: "Building a Large-Scale Billing Ledger: Why, What, and How We Evaluated"
 date: 2026-03-27
-categories: [architecture, billing]
 ---
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
