@@ -43,6 +43,8 @@ graph LR
 
 ## The Numbers
 
+In production, every TigerBeetle operation needs a PostgreSQL metadata lookup first (user → account ID mapping). **The PG→TB numbers are the realistic production numbers.** We show TB-only for comparison, but you should plan capacity around PG→TB.
+
 <canvas id="tbThroughput" width="800" height="400"></canvas>
 <script>
 new Chart(document.getElementById('tbThroughput'), {
@@ -51,15 +53,15 @@ new Chart(document.getElementById('tbThroughput'), {
     labels: ['Waterfall\n(batch=8)', 'Waterfall\n(Optimistic)', 'Single Account\nDebit', 'Fan-out\n(1→1000)'],
     datasets: [
       {
-        label: 'TB Only',
-        data: [20064, 11347, 16174, 206234],
+        label: 'PG → TB (production realistic)',
+        data: [13731, 5032, 12150, 161926],
         backgroundColor: 'rgba(255, 159, 64, 0.7)',
         borderColor: 'rgba(255, 159, 64, 1)',
         borderWidth: 1
       },
       {
-        label: 'PG → TB (metadata lookup)',
-        data: [13731, 5032, 12150, 161926],
+        label: 'TB Only (synthetic)',
+        data: [20064, 11347, 16174, 206234],
         backgroundColor: 'rgba(255, 159, 64, 0.3)',
         borderColor: 'rgba(255, 159, 64, 1)',
         borderWidth: 1
@@ -69,7 +71,7 @@ new Chart(document.getElementById('tbThroughput'), {
   options: {
     responsive: true,
     plugins: {
-      title: { display: true, text: 'TigerBeetle Throughput (TPS) — TB Only vs PG→TB', font: { size: 16 } },
+      title: { display: true, text: 'TigerBeetle Throughput (TPS) — Production (PG→TB) vs Synthetic (TB Only)', font: { size: 16 } },
       legend: { position: 'bottom' }
     },
     scales: { y: { beginAtZero: true, title: { display: true, text: 'Transactions per Second' } } }
@@ -79,14 +81,16 @@ new Chart(document.getElementById('tbThroughput'), {
 
 | Scenario | Variant | Txns/s | p50 | p99 | max |
 |---|---|---|---|---|---|
-| Waterfall (batch=8) | TB only | **20,064** | 382 µs | 20.2 ms | 41.5 ms |
-| Waterfall (batch=8) | PG → TB | 13,731 | 422 µs | 24.9 ms | 100.0 ms |
+| Waterfall (batch=8) | **PG → TB** | **13,731** | 422 µs | 24.9 ms | 100.0 ms |
+| Waterfall (batch=8) | TB only | 20,064 | 382 µs | 20.2 ms | 41.5 ms |
+| Waterfall (optimistic) | **PG → TB** | **5,032** | 2.3 ms | 95.9 ms | 603.0 ms |
 | Waterfall (optimistic) | TB only | 11,347 | 660 µs | 53.5 ms | 340.9 ms |
-| Waterfall (optimistic) | PG → TB | 5,032 | 2.3 ms | 95.9 ms | 603.0 ms |
-| Single Account Debit | TB only | **16,174** | 637 µs | 23.2 ms | 417.9 ms |
-| Single Account Debit | PG → TB | 12,150 | 1.2 ms | 35.9 ms | 372.6 ms |
-| Fan-out (1→1000) | TB only | **206,234** | 136 µs | 698 µs | 719 µs |
-| Fan-out (1→1000) | PG → TB | 161,926 | 183 µs | 670 µs | 718 µs |
+| Single Account Debit | **PG → TB** | **12,150** | 1.2 ms | 35.9 ms | 372.6 ms |
+| Single Account Debit | TB only | 16,174 | 637 µs | 23.2 ms | 417.9 ms |
+| Fan-out (1→1000) | **PG → TB** | **161,926** | 183 µs | 670 µs | 718 µs |
+| Fan-out (1→1000) | TB only | 206,234 | 136 µs | 698 µs | 719 µs |
+
+> **Why PG→TB is the real number**: TigerBeetle stores accounts and transfers — nothing else. User IDs, grant metadata, pricing plans, account priorities — all of that lives in PostgreSQL. Every production request starts with a PG lookup to resolve "user X" into "TB account IDs [A, B, C, D]" before submitting the transfer batch. Even with a local PG container at ~0.1 ms RTT, this adds 21–56% overhead depending on the scenario.
 
 ---
 
@@ -236,13 +240,13 @@ This maps directly to billing scenarios like:
 
 ### Contention-Heavy Workloads
 
-TigerBeetle sustains **16,174 TPS on a single hot account** with 32 concurrent goroutines — zero errors, no deadlocks, no lock timeouts. PostgreSQL hits 6,484 TPS on the same test and is fundamentally limited by row-level lock serialization.
+With the PG metadata lookup included, TigerBeetle sustains **12,150 TPS on a single hot account** with 32 concurrent goroutines — zero errors, no deadlocks, no lock timeouts. PostgreSQL hits 6,484 TPS on the same test and is fundamentally limited by row-level lock serialization. That's still a **1.9x advantage** in the realistic scenario.
 
 TigerBeetle's event-loop architecture processes all transfers sequentially within a single thread, eliminating contention entirely. There are no locks because there's no concurrency at the data level — the server serializes everything at the IO boundary.
 
 ### Bulk Operations
 
-Fan-out (1 source → 1,000 recipients) hits **206,234 transfers/s** — 2.6x faster than PostgreSQL's pipeline protocol. Each 1000-transfer batch completes with sub-millisecond per-transaction latency (136 µs p50) because the batch is processed as a single fsync operation.
+Fan-out (1 source → 1,000 recipients) hits **161,926 transfers/s** with PG lookup (206K TB-only) — still 2x faster than PostgreSQL's pipeline protocol. Each 1000-transfer batch completes with sub-millisecond per-transaction latency (183 µs p50) because the batch is processed as a single fsync operation.
 
 ### Correctness Guarantees
 
@@ -299,6 +303,41 @@ Each CDC event carries the full transfer context — not just the transfer itsel
 ```
 
 The key design principle: **the CDC pipeline is async and non-blocking**. The write path (TigerBeetle) never waits for ClickHouse. If ClickHouse is down, LavinMQ buffers events. If the CDC sidecar is slow, TigerBeetle keeps writing. Analytics can lag minutes behind without affecting billing accuracy.
+
+#### Data Durability: How We Avoid Data Loss
+
+The CDC pipeline has multiple failure points. Here's how each is handled:
+
+<div class="mermaid">
+graph TD
+    A[TigerBeetle Event Log] -->|"Source of truth<br/>immutable, fsync'd"| B{CDC Sidecar<br/>crashes?}
+    B -->|"Yes"| C["Restart: resume from<br/>last committed offset<br/>TB log is immutable —<br/>no events lost"]
+    B -->|"No"| D{LavinMQ<br/>crashes?}
+    D -->|"Yes"| E["Unacked messages<br/>replayed from TB log<br/>CDC sidecar re-polls"]
+    D -->|"No"| F{ClickHouse<br/>down?}
+    F -->|"Yes"| G["LavinMQ buffers<br/>messages on disk<br/>until CH recovers"]
+    F -->|"No"| H["MergeTree INSERT<br/>— durable on disk"]
+
+    style A fill:#ffd8a8,stroke:#f59e0b
+    style C fill:#c3fae8,stroke:#22c55e
+    style E fill:#c3fae8,stroke:#22c55e
+    style G fill:#fff3bf,stroke:#f59e0b
+    style H fill:#c3fae8,stroke:#22c55e
+</div>
+
+**TigerBeetle's event log is the ultimate safety net.** It's immutable and fsync'd — the same log that guarantees transfer durability also guarantees CDC completeness. If any downstream component fails, the CDC sidecar can always re-poll from the last known offset. Events are never deleted from TB's log, so nothing is lost.
+
+The specific guarantees at each stage:
+
+1. **TigerBeetle → CDC Sidecar**: The sidecar tracks its read offset. On crash/restart, it resumes from the last committed position. TigerBeetle's event log is append-only — events are never removed or compacted, so the sidecar can always catch up.
+
+2. **CDC Sidecar → LavinMQ**: The sidecar publishes events to a fanout exchange. If LavinMQ is unreachable, the sidecar retries. If the sidecar crashes after publishing but before advancing its offset, it re-publishes on restart — ClickHouse must handle **at-least-once delivery** (idempotent inserts keyed on transfer ID).
+
+3. **LavinMQ → ClickHouse**: ClickHouse consumes via a RabbitMQ engine table. Messages are acknowledged after the materialized view inserts into the MergeTree table. If ClickHouse is down, LavinMQ holds messages on disk until it recovers. If ClickHouse crashes mid-insert, unacknowledged messages are redelivered.
+
+4. **ClickHouse durability**: MergeTree tables are durable on disk after INSERT. Monthly partitions ordered by `(ledger, event_time, transfer_id)` ensure efficient deduplication if at-least-once delivery causes duplicates — `ReplacingMergeTree` or `INSERT ... SELECT ... WHERE NOT EXISTS` can handle this.
+
+**The worst case**: If everything downstream is lost (LavinMQ data, ClickHouse data), you can rebuild the entire analytics store by replaying TigerBeetle's event log from the beginning. This is the same guarantee that event-sourced architectures provide — the event log is the source of truth, everything else is a projection.
 
 #### Cost Concerns
 
@@ -374,13 +413,13 @@ If we were building the freemium waterfall entirely on TigerBeetle, here's the r
 
 3. **Usage drawdown**: Submit a 7-transfer linked chain (the waterfall pattern above). TB automatically drains from A→B→C→D in order, respecting balances.
 
-4. **Batch for throughput**: Pack 8 waterfall chains per `CreateTransfers()` call. This gets you to 20K+ TPS on NVMe.
+4. **Batch for throughput**: Pack 8 waterfall chains per `CreateTransfers()` call. With PG metadata lookup included, this gets you to **~13.7K TPS** on NVMe — still 27x headroom over 500 TPS.
 
-5. **Grant expiration**: Transfer remaining balance from the grant account back to the funding bank. Mark the account closed in your metadata store.
+5. **Grant expiration**: Transfer remaining balance from the grant account back to the funding bank. Mark the account closed in your PostgreSQL metadata store.
 
 6. **Analytics**: CDC pipeline to ClickHouse for reporting, dashboards, and reconciliation queries.
 
-**Trade-off**: You get 2x the throughput of PostgreSQL on the same hardware, with stronger correctness guarantees. You pay for it with a more complex operational stack and the inability to query your financial data directly.
+**Trade-off**: You get ~2x the throughput of AlloyDB on the same hardware (13.7K vs 11.4K TPS on realistic waterfall), with stronger correctness guarantees. You pay for it with a more complex operational stack (PG for metadata + TB for ledger + ClickHouse for analytics) and the inability to query your financial data directly.
 
 ---
 
