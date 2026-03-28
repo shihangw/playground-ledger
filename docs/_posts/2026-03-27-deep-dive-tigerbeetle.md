@@ -23,20 +23,19 @@ The architecture looks like this:
 
 <div class="mermaid">
 graph LR
-    A[Go Service<br/>32 goroutines] -->|user lookup| B[(PostgreSQL<br/>metadata)]
+    A[Go Service] -->|user lookup| B[(PostgreSQL<br/>metadata)]
     A -->|write txns| C[(TigerBeetle<br/>ledger)]
-    C -->|poll event log| D[CDC Sidecar<br/>tb amqp]
-    D -->|publish| E[LavinMQ<br/>AMQP broker]
-    E -->|fanout| F[(ClickHouse<br/>MergeTree)]
-    F --> G[OLAP Views<br/>daily vol / balances]
+    C -->|poll event log| D[CDC Sidecar]
+    D -->|streaming insert| BQ[(BigQuery)]
+    D -.->|or: publish| E[LavinMQ] -.-> CH[(ClickHouse)]
 
     style C fill:#ffd8a8,stroke:#f59e0b
     style B fill:#a5d8ff,stroke:#4a9eed
-    style F fill:#c3fae8,stroke:#22c55e
+    style BQ fill:#a5d8ff,stroke:#4a9eed
+    style CH fill:#c3fae8,stroke:#22c55e
     style D fill:#d0bfff,stroke:#8b5cf6
     style E fill:#d0bfff,stroke:#8b5cf6
     style A fill:#a5d8ff,stroke:#4a9eed
-    style G fill:#c3fae8,stroke:#22c55e
 </div>
 
 ---
@@ -309,83 +308,94 @@ Each CDC event carries the full transfer context — not just the transfer itsel
 }
 ```
 
-The key design principle: **the CDC pipeline is async and non-blocking**. The write path (TigerBeetle) never waits for ClickHouse. If ClickHouse is down, LavinMQ buffers events. If the CDC sidecar is slow, TigerBeetle keeps writing. Analytics can lag minutes behind without affecting billing accuracy.
+The key design principle: **the CDC pipeline is async and non-blocking**. The write path (TigerBeetle) never waits for the analytics store. The CDC sidecar polls TB's event log independently. Analytics can lag minutes behind without affecting billing accuracy.
+
+#### Why CDC, Not Double-Write?
+
+An alternative to CDC is having the application write to both TigerBeetle and the analytics store directly. We chose CDC because:
+
+- **No dual-write consistency risk.** If the app writes to TB successfully but the BigQuery/ClickHouse write fails, your data is inconsistent. With CDC, TigerBeetle's event log is the single source of truth — the analytics store is just a projection.
+- **No hot-path impact.** The app only writes to TB. Analytics ingestion happens out-of-band.
+- **Full rebuild from scratch.** If the analytics store is lost, replay the entire TB event log. With double-write, lost events are gone forever.
+- **Simpler app code.** No retry logic, no error handling for two write targets.
+
+The only advantage of double-write is fewer moving parts (no sidecar, no broker). But if you make the second write async to avoid latency impact, you're essentially reinventing CDC — with worse guarantees.
+
+#### Where Should CDC Write To? ClickHouse vs BigQuery
+
+The CDC sidecar can target different analytics stores. The choice depends on your query latency needs:
+
+<div class="mermaid">
+graph LR
+    TB[(TigerBeetle)] -->|poll event log| CDC[CDC Sidecar]
+    CDC -->|"Option A"| MQ[LavinMQ] --> CH[(ClickHouse)]
+    CDC -->|"Option B"| BQ[(BigQuery)]
+
+    style TB fill:#ffd8a8,stroke:#f59e0b
+    style CDC fill:#d0bfff,stroke:#8b5cf6
+    style MQ fill:#d0bfff,stroke:#8b5cf6
+    style CH fill:#c3fae8,stroke:#22c55e
+    style BQ fill:#a5d8ff,stroke:#4a9eed
+</div>
+
+| | ClickHouse (self-hosted) | BigQuery (serverless) |
+|---|---|---|
+| **Ingestion latency** | Sub-second (MergeTree INSERT) | Seconds (streaming API) |
+| **Query latency** | Sub-second on hot data | Seconds (serverless cold start) |
+| **Ops burden** | You run it (upgrades, disk, monitoring) | Zero — fully managed |
+| **Cost at 500 TPS** | ~$50-150/mo (compute + storage) | ~$10-30/mo (storage + $5/TB queried) |
+| **Cost at 5K TPS** | ~$500-1K/mo | ~$50-100/mo (scales better) |
+| **Cold storage** | Detach to GCS, query via `s3()` | Native — BQ *is* cold storage that's queryable |
+| **GCP native** | No (run on GCE) | Yes (IAM, audit logs, Data Studio) |
+| **Best for** | Real-time dashboards, live alerting | Batch reconciliation, compliance audits, finance |
+
+**For our use case** — reconciliation against the existing billing system, monthly finance audits, compliance queries — **BigQuery is the simpler choice**. We don't need sub-second dashboard queries. The pipeline simplifies to:
+
+```
+TigerBeetle → CDC sidecar → BigQuery (streaming insert API)
+```
+
+No LavinMQ, no ClickHouse to operate. One fewer service. If we later need real-time dashboards, we can add ClickHouse as a second CDC consumer without changing the write path.
 
 #### Data Durability: How We Avoid Data Loss
 
-The CDC pipeline has multiple failure points. Here's how each is handled:
+Regardless of whether CDC targets ClickHouse or BigQuery, the durability model is the same:
 
 <div class="mermaid">
 graph TD
     A[TigerBeetle Event Log] -->|"Source of truth<br/>immutable, fsync'd"| B{CDC Sidecar<br/>crashes?}
     B -->|"Yes"| C["Restart: resume from<br/>last committed offset<br/>TB log is immutable —<br/>no events lost"]
-    B -->|"No"| D{LavinMQ<br/>crashes?}
-    D -->|"Yes"| E["Unacked messages<br/>replayed from TB log<br/>CDC sidecar re-polls"]
-    D -->|"No"| F{ClickHouse<br/>down?}
-    F -->|"Yes"| G["LavinMQ buffers<br/>messages on disk<br/>until CH recovers"]
-    F -->|"No"| H["MergeTree INSERT<br/>— durable on disk"]
+    B -->|"No"| D{Analytics store<br/>down?}
+    D -->|"Yes"| E["Sidecar retries<br/>or LavinMQ buffers<br/>until store recovers"]
+    D -->|"No"| F["INSERT succeeds<br/>— durable"]
 
     style A fill:#ffd8a8,stroke:#f59e0b
     style C fill:#c3fae8,stroke:#22c55e
-    style E fill:#c3fae8,stroke:#22c55e
-    style G fill:#fff3bf,stroke:#f59e0b
-    style H fill:#c3fae8,stroke:#22c55e
+    style E fill:#fff3bf,stroke:#f59e0b
+    style F fill:#c3fae8,stroke:#22c55e
 </div>
 
-**TigerBeetle's event log is the ultimate safety net.** It's immutable and fsync'd — the same log that guarantees transfer durability also guarantees CDC completeness. If any downstream component fails, the CDC sidecar can always re-poll from the last known offset. Events are never deleted from TB's log, so nothing is lost.
+**TigerBeetle's event log is the ultimate safety net.** It's immutable and fsync'd — the same log that guarantees transfer durability also guarantees CDC completeness. Events are never deleted from TB's log.
 
-The specific guarantees at each stage:
+The specific guarantees:
 
-1. **TigerBeetle → CDC Sidecar**: The sidecar tracks its read offset. On crash/restart, it resumes from the last committed position. TigerBeetle's event log is append-only — events are never removed or compacted, so the sidecar can always catch up.
+1. **TigerBeetle → CDC Sidecar**: The sidecar tracks its read offset. On crash/restart, it resumes from the last committed position. TB's event log is append-only — the sidecar can always catch up.
 
-2. **CDC Sidecar → LavinMQ**: The sidecar publishes events to a fanout exchange. If LavinMQ is unreachable, the sidecar retries. If the sidecar crashes after publishing but before advancing its offset, it re-publishes on restart — ClickHouse must handle **at-least-once delivery** (idempotent inserts keyed on transfer ID).
+2. **CDC Sidecar → Analytics store**: The sidecar delivers at-least-once. If it crashes after writing but before advancing its offset, it re-sends on restart. The analytics store must handle deduplication (keyed on transfer ID).
 
-3. **LavinMQ → ClickHouse**: ClickHouse consumes via a RabbitMQ engine table. Messages are acknowledged after the materialized view inserts into the MergeTree table. If ClickHouse is down, LavinMQ holds messages on disk until it recovers. If ClickHouse crashes mid-insert, unacknowledged messages are redelivered.
+3. **Analytics store durability**: BigQuery streaming inserts are durable once acknowledged. ClickHouse MergeTree INSERTs are durable on disk. Both handle deduplication — BigQuery via `INSERT ... WHERE NOT EXISTS`, ClickHouse via `ReplacingMergeTree`.
 
-4. **ClickHouse durability**: MergeTree tables are durable on disk after INSERT. Monthly partitions ordered by `(ledger, event_time, transfer_id)` ensure efficient deduplication if at-least-once delivery causes duplicates — `ReplacingMergeTree` or `INSERT ... SELECT ... WHERE NOT EXISTS` can handle this.
+**The worst case**: If the entire analytics store is lost, replay TigerBeetle's event log from the beginning. This is the same guarantee event-sourced architectures provide — the event log is the source of truth, everything else is a projection.
 
-**The worst case**: If everything downstream is lost (LavinMQ data, ClickHouse data), you can rebuild the entire analytics store by replaying TigerBeetle's event log from the beginning. This is the same guarantee that event-sourced architectures provide — the event log is the source of truth, everything else is a projection.
-
-#### Cost Concerns
+#### Cost Summary
 
 | Component | Cost Driver | Estimate at 500 TPS |
 |---|---|---|
-| **TigerBeetle** | NVMe storage only (open source) | ~$75/mo (375 GB local NVMe on GCP) |
-| **CDC Sidecar** | CPU only (runs alongside TB) | ~$0 marginal (shares the instance) |
-| **LavinMQ** | Transient — messages consumed in seconds | ~$0 marginal (minimal memory) |
-| **ClickHouse** | **Biggest cost driver** — stores full event history | ~$50-150/mo (1.3B rows/mo, ~40 GB compressed) |
-| **Cold storage (GCS)** | Detached old partitions | ~$0.02/GB/mo |
-
-At 500 TPS, the full CDC stack adds roughly **$100-200/mo** on top of TigerBeetle itself. The cost scales linearly with TPS — at 5,000 TPS, expect ~$500-1,000/mo for ClickHouse storage. The critical cost control is **partition detachment**: monthly partitions older than your active query window detach to GCS at $0.02/GB/mo instead of $0.12/GB/mo on ClickHouse.
-
-#### Cold Partitions Are Still Queryable
-
-Detaching to GCS doesn't mean losing query access. ClickHouse can query GCS data directly via its `s3()` table function (GCS exposes an S3-compatible API):
-
-```sql
--- Query a detached monthly partition directly from GCS
-SELECT
-    toDate(event_time) AS day,
-    count() AS transfers,
-    sum(amount) AS volume
-FROM s3(
-    'https://storage.googleapis.com/billing-archive/transfers/2026-01/*.parquet',
-    'Parquet'
-)
-WHERE ledger = 1
-GROUP BY day
-ORDER BY day
-```
-
-This gives you the best of both worlds: hot partitions (last 3–6 months) live in MergeTree for sub-second queries, while cold partitions sit in GCS at ~6x lower cost but remain queryable in seconds. For one-off audits or compliance queries that reach back years, the cold scan latency (seconds, not milliseconds) is perfectly acceptable.
-
-If you need cold data back at full speed temporarily (e.g., end-of-year audit), you can re-attach the partition:
-
-```sql
-ALTER TABLE transfers ATTACH PARTITION '202601'
-```
-
-This is a metadata operation — ClickHouse reads the data back from GCS into local MergeTree storage.
+| **TigerBeetle** | NVMe storage (open source) | ~$75/mo (375 GB local NVMe on GCP) |
+| **CDC Sidecar** | CPU (runs alongside TB) | ~$0 marginal |
+| **BigQuery (recommended)** | Storage + query | ~$10-30/mo |
+| **ClickHouse (if real-time needed)** | Compute + storage | ~$50-150/mo |
+| **LavinMQ (ClickHouse only)** | Transient messages | ~$0 marginal |
 
 ### Metadata Lives Elsewhere
 
@@ -453,9 +463,9 @@ If we were building the freemium waterfall entirely on TigerBeetle, here's the r
 
 5. **Grant expiration**: Transfer remaining balance from the grant account back to the funding bank. Mark the account closed in your PostgreSQL metadata store.
 
-6. **Analytics**: CDC pipeline to ClickHouse for reporting, dashboards, and reconciliation queries.
+6. **Analytics**: CDC pipeline to BigQuery (recommended) or ClickHouse for reporting, reconciliation, and compliance queries. BigQuery is zero-ops and GCP-native; ClickHouse if you need real-time dashboards.
 
-**Trade-off**: You get ~2x the throughput of AlloyDB on the same hardware (13.7K vs 11.4K TPS on realistic waterfall), with stronger correctness guarantees. You pay for it with a more complex operational stack (PG for metadata + TB for ledger + ClickHouse for analytics) and the inability to query your financial data directly.
+**Trade-off**: You get ~2x the throughput of AlloyDB on the same hardware (13.7K vs 11.4K TPS on realistic waterfall), with stronger correctness guarantees. You pay for it with a more complex operational stack (PG for metadata + TB for ledger + BigQuery/ClickHouse for analytics) and the inability to query your financial data directly from the ledger.
 
 ---
 
