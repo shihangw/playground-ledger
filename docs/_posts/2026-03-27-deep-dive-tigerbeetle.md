@@ -98,16 +98,23 @@ new Chart(document.getElementById('tbThroughput'), {
 
 TigerBeetle doesn't have SQL transactions. Instead, it has **linked transfers** — a sequence of transfers where all succeed or all fail atomically. This is the primitive we use to build the waterfall.
 
-Our waterfall uses a 7-transfer linked chain to debit from 4 source accounts (A, B, C, D) in priority order:
+Our waterfall uses a 7-transfer linked chain to debit from 4 source accounts in priority order. This mimics our freemium billing model where a user has multiple credit grants with different lifetimes:
+
+- **Account A** — Daily credit ($5, refreshed every 24h, consumed first)
+- **Account B** — Monthly credit ($5, refreshed every billing cycle)
+- **Account C** — Bonus/promotional credit ($5, one-time grant)
+- **Account D** — Cash balance ($100K, safety net, never topped up)
+
+When a user makes an API call costing $0.10, the chain tries A first. If A is depleted (e.g., after 50 calls), it cascades to B, then C, then D.
 
 ```
-Transfer 1: SETUP → LIMIT       (establish ceiling)     [Linked]
-Transfer 2: A → SETUP           (try primary)           [Linked + BalancingDebit + BalancingCredit]
-Transfer 3: B → SETUP           (try secondary)         [Linked + BalancingDebit + BalancingCredit]
-Transfer 4: C → SETUP           (try tertiary)          [Linked + BalancingDebit + BalancingCredit]
-Transfer 5: D → SETUP           (try cash reserve)      [Linked + BalancingDebit + BalancingCredit]
-Transfer 6: SETUP → DESTINATION (deliver funds)         [Linked]
-Transfer 7: LIMIT → SETUP       (reset ceiling)         [BalancingCredit only — NOT linked]
+Transfer 1: SETUP → LIMIT       (establish withdrawal ceiling)  [Linked]
+Transfer 2: A → SETUP           (try daily credit)              [Linked + BalancingDebit/Credit]
+Transfer 3: B → SETUP           (try monthly credit)            [Linked + BalancingDebit/Credit]
+Transfer 4: C → SETUP           (try bonus credit)              [Linked + BalancingDebit/Credit]
+Transfer 5: D → SETUP           (try cash balance)              [Linked + BalancingDebit/Credit]
+Transfer 6: SETUP → DESTINATION (deliver funds to usage account) [Linked]
+Transfer 7: LIMIT → SETUP       (reset ceiling)                 [BalancingCredit only — NOT linked]
 ```
 
 The magic is in the `BalancingDebit` and `BalancingCredit` flags. When set, TigerBeetle automatically adjusts the transfer amount to respect the source account's available balance. If account A has $3 but we're drawing $5, it takes the $3 and the next transfer in the chain picks up the remaining $2 from B. The server enforces all of this — **no application-level balance reads required**.
