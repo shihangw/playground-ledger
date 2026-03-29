@@ -1,5 +1,7 @@
 # Playground Ledger — Research Summary
 
+**[Read the technical blog](https://shihangw.github.io/playground-ledger/)**
+
 Learnings from benchmarking and designing an in-house billing ledger to replace Orb. Covers
 AlloyDB (PostgreSQL), TigerBeetle, industry reference, and architecture trade-offs.
 
