@@ -267,8 +267,8 @@ Regardless of which database powers the ledger, these principles hold:
 
 The next two articles in this series go deep on each database:
 
-- **[Deep Dive: TigerBeetle]({% post_url 2026-03-27-deep-dive-tigerbeetle %})** — linked transfer chains, batching strategies, the fsync ceiling, and how to build a waterfall on a purpose-built financial database.
-- **[Deep Dive: PostgreSQL on AlloyDB]({% post_url 2026-03-27-deep-dive-postgresql-alloydb %})** — optimistic CTEs, pipeline protocol batching, grant waterfall with lock ordering, and why `synchronous_commit=off` is safer than you think on AlloyDB.
+- **[Deep Dive: TigerBeetle]({{ site.baseurl }}{% post_url 2026-03-27-deep-dive-tigerbeetle %})** — linked transfer chains, batching strategies, the fsync ceiling, and how to build a waterfall on a purpose-built financial database.
+- **[Deep Dive: PostgreSQL on AlloyDB]({{ site.baseurl }}{% post_url 2026-03-27-deep-dive-postgresql-alloydb %})** — optimistic CTEs, pipeline protocol batching, grant waterfall with lock ordering, and why `synchronous_commit=off` is safer than you think on AlloyDB.
 
 All benchmark code, schemas, and Docker setups are open source: **[github.com/shihangw/playground-ledger](https://github.com/shihangw/playground-ledger)**
 

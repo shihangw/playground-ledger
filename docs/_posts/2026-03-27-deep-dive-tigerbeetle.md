@@ -481,4 +481,4 @@ In production with 3-node cluster replication (VSR consensus), you pay an additi
 
 ---
 
-*Next: [Deep Dive: PostgreSQL on AlloyDB]({% post_url 2026-03-27-deep-dive-postgresql-alloydb %}) — how we achieved 39,690 TPS with optimistic CTEs, and why PostgreSQL might be all you need.*
+*Next: [Deep Dive: PostgreSQL on AlloyDB]({{ site.baseurl }}{% post_url 2026-03-27-deep-dive-postgresql-alloydb %}) — how we achieved 39,690 TPS with optimistic CTEs, and why PostgreSQL might be all you need.*

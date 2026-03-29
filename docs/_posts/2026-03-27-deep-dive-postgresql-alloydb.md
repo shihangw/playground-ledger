@@ -390,4 +390,4 @@ We're shipping on AlloyDB. If we ever outgrow it, the double-entry model ports c
 
 ---
 
-*This is Part 3 of a 3-part series. See also: [Building a Billing Ledger]({% post_url 2026-03-27-building-a-billing-ledger %}) and [Deep Dive: TigerBeetle]({% post_url 2026-03-27-deep-dive-tigerbeetle %}).*
+*This is Part 3 of a 3-part series. See also: [Building a Billing Ledger]({{ site.baseurl }}{% post_url 2026-03-27-building-a-billing-ledger %}) and [Deep Dive: TigerBeetle]({{ site.baseurl }}{% post_url 2026-03-27-deep-dive-tigerbeetle %}).*
